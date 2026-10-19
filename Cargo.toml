@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
-eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "persistence"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -39,6 +39,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
 ] }
 
 [build-dependencies]
