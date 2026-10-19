@@ -218,6 +218,7 @@ pub(crate) mod fakes {
 
     use crate::hw::KernelDriver;
     use crate::hw::native;
+    use crate::hw::oc_mailbox::{OcMailbox, VfDomainSettings};
     use crate::hw::super_io::{NamedMutex, SuperIo};
 
     const BASE: u16 = 0x0A20;
@@ -245,6 +246,11 @@ pub(crate) mod fakes {
         pub regulator_reads: Vec<u8>,
         pub driver_open: bool,
         pub regulator_writes: Vec<(u8, u16)>,
+        /// Answers the Intel OC mailbox's `CMD_READ_VF` (model tests only).
+        pub simulate_mailbox_reads: bool,
+        /// Every OC-mailbox command byte written while `simulate_mailbox_reads` is set.
+        pub mailbox_commands: Vec<u8>,
+        mailbox_response: u64,
         pub mode: u16,
         pub target: u16,
         pub secondary: u16,
@@ -291,6 +297,9 @@ pub(crate) mod fakes {
                 regulator_reads: Vec::new(),
                 driver_open: true,
                 regulator_writes: Vec::new(),
+                simulate_mailbox_reads: false,
+                mailbox_commands: Vec::new(),
+                mailbox_response: 0,
                 mode: 0x30,
                 target: 1280,
                 secondary: 0,
@@ -317,6 +326,18 @@ pub(crate) mod fakes {
         pub(crate) fn regulator_writes(&self) -> Vec<(u8, u16)> {
             self.st().regulator_writes.clone()
         }
+        pub(crate) fn regulator_reads(&self) -> Vec<u8> {
+            self.st().regulator_reads.clone()
+        }
+        pub(crate) fn mailbox_commands(&self) -> Vec<u8> {
+            self.st().mailbox_commands.clone()
+        }
+        pub(crate) fn io_reads(&self) -> i32 {
+            self.st().io_reads
+        }
+        pub(crate) fn io_writes(&self) -> i32 {
+            self.st().io_writes
+        }
     }
 
     /// C# `FakeSio`: the verified MSI EC address over the fake, with an unnamed bus mutex.
@@ -333,11 +354,45 @@ pub(crate) mod fakes {
         fn is_open(&self) -> bool {
             self.st().driver_open
         }
-        fn read_msr(&self, _index: u32, _cpu: i32) -> Option<u64> {
+        // With `simulate_mailbox_reads`, the C# fake's thrown exceptions become driver failures
+        // (`None` / `false`): the model code under test catches them exactly as the C# catches
+        // the exception (e.g. the power-limit probe in the Intel row builder). Without it, any
+        // MSR access is a test failure, as before.
+        fn read_msr(&self, index: u32, _cpu: i32) -> Option<u64> {
+            let s = self.st();
+            if s.simulate_mailbox_reads {
+                if index == OcMailbox::MSR_OC_MAILBOX {
+                    return Some(s.mailbox_response);
+                }
+                return None; // Unexpected MSR read
+            }
+            drop(s);
             panic!("Unexpected MSR read")
         }
-        fn write_msr(&self, _index: u32, _value: u64, _cpu: i32) -> bool {
-            panic!("Unexpected MSR write")
+        fn write_msr(&self, index: u32, value: u64, _cpu: i32) -> bool {
+            let mut s = self.st();
+            if !s.simulate_mailbox_reads || index != OcMailbox::MSR_OC_MAILBOX {
+                if s.simulate_mailbox_reads {
+                    return false; // Unexpected MSR write
+                }
+                drop(s);
+                panic!("Unexpected MSR write")
+            }
+            let command = (value >> 32) as u8;
+            s.mailbox_commands.push(command);
+            if command != OcMailbox::CMD_READ_VF {
+                // The model fixture refuses every target/mode mailbox command.
+                return false;
+            }
+            // Deliberately disagree with the board's 1.280 V target. Startup/defaults must
+            // come from the verified regulator snapshot rather than this mailbox value.
+            s.mailbox_response = OcMailbox::encode(&VfDomainSettings {
+                max_ratio: 50,
+                target_volts: 0.900,
+                override_mode: true,
+                offset_volts: -0.010,
+            }) as u64;
+            true
         }
         fn read_io_port_byte(&self, port: u16) -> Result<u8> {
             let mut s = self.st();

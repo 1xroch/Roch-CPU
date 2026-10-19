@@ -135,3 +135,7 @@ pub(super) fn clear_msi_core_override(regulator: &MsiCoreVoltage, mailbox: &OcMa
         |before| mailbox.write_domain(OcMailbox::DOMAIN_CORE, &before),
     )
 }
+
+#[cfg(test)]
+#[path = "core_voltage_recovery_tests.rs"]
+mod tests;

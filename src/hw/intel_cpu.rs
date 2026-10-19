@@ -178,6 +178,36 @@ impl IntelCpu {
         })
     }
 
+    /// Test seam for the C# model tests, which build an uninitialised `IntelCpu` and set only
+    /// `_drv` and `Mailbox` (CPU 0): no CPUID, topology, thread pinning or MSR access here.
+    /// Every other field keeps its zero/empty value.
+    #[cfg(test)]
+    pub(crate) fn with_driver_only_for_test(driver: Arc<dyn KernelDriver>) -> Self {
+        Self {
+            mailbox: OcMailbox::new(driver.clone(), 0),
+            drv: driver,
+            brand_string: String::new(),
+            family: 0,
+            model: 0,
+            stepping: 0,
+            is_hybrid: false,
+            hypervisor_present: false,
+            logical_cpus: Vec::new(),
+            p_core_count: 0,
+            e_core_count: 0,
+            first_p_thread: 0,
+            first_e_thread: 0,
+            generation: String::new(),
+            is_lga1700_family: false,
+            base_ratio: 0,
+            min_ratio: 0,
+            ratio_limits_programmable: false,
+            tdp_programmable: false,
+            tj_max: 0,
+            microcode_revision: 0,
+        }
+    }
+
     // ------------------------------------------------------------- properties
     pub fn brand_string(&self) -> &str {
         &self.brand_string

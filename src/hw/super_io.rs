@@ -199,6 +199,14 @@ impl SuperIo {
         self
     }
 
+    /// Test seam for the C# tests' reflection (`SetProperty(sio, "Kind", …)`): an object of
+    /// another Super I/O family, used only to check that capability gates refuse it.
+    #[cfg(test)]
+    pub(crate) fn replace_kind_for_test(mut self, kind: SuperIoKind) -> SuperIo {
+        self.kind = kind;
+        self
+    }
+
     // ---------------------------------------------------------------- detection
     /// Detects the Super I/O. Returns the chip (if any) and a status line.
     pub fn try_create(drv: &Arc<dyn KernelDriver>) -> Result<(Option<SuperIo>, String)> {
