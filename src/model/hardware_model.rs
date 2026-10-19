@@ -858,7 +858,7 @@ impl HardwareModel {
             s.write = Some(Arc::new(move |v| a2.set_core_voltage(v)));
             s.restore_default = Some(Arc::new(move || {
                 let baseline = a3.baseline_svid().ok_or_else(|| anyhow!("no ASUS core baseline"))?;
-                a3.set_svid(&baseline, AsusBoardControl::CORE_ID)
+                a3.set_svid(baseline, AsusBoardControl::CORE_ID)
             }));
             s.require_read_back = true;
             s.note = Some("ASUS Global Core SVID Manual request, not a measured voltage. The applied target is read back from ASUS; measured Vcore is shown below it. The difference can vary with board regulation and load, even with BIOS settings on Auto. No automatic voltage compensation is applied. Enter 0 to restore the starting ASUS voltage state.".into());
@@ -882,7 +882,7 @@ impl HardwareModel {
                 if !(0.0..=u32::MAX as f64).contains(&idx) {
                     bail!("Arithmetic operation resulted in an overflow.");
                 }
-                a2.set_svid(&SvidState { offset_index: idx as u32, ..state }, AsusBoardControl::CORE_ID)
+                a2.set_svid(SvidState { offset_index: idx as u32, ..state }, AsusBoardControl::CORE_ID)
             }));
             o.note = Some("ASUS adaptive SVID offset. Available for changes while CPU Core is in Auto/adaptive mode.".into());
             rows[index] = o;
@@ -911,7 +911,7 @@ impl HardwareModel {
                 let (a1, a2, a3) = (asus.clone(), asus.clone(), asus.clone());
                 s.read = Arc::new(move || a1.read_voltage_target(id));
                 s.write = Some(Arc::new(move |v| a2.set_rail_voltage(id, v)));
-                s.restore_default = Some(Arc::new(move || a3.set_svid(&baseline, id)));
+                s.restore_default = Some(Arc::new(move || a3.set_svid(baseline, id)));
                 s.note = Some(format!(
                     "ASUS Manual voltage target through the board's dedicated control. Mode, target and offset are read back together; a failed request restores the previous state. Enter 0 to restore the startup state. {}",
                     if id == AsusBoardControl::RING_ID {
@@ -930,7 +930,7 @@ impl HardwareModel {
         // ---------------- power limits ----------------
         if let Some(c) = &cpu {
             if let Ok(pl) = c.read_package_power_limits() {
-                self.power_limits_locked.store(pl.2, Ordering::SeqCst);
+                self.power_limits_locked.store(pl.locked, Ordering::SeqCst);
             }
         }
         let locked = self.power_limits_locked();
@@ -947,7 +947,7 @@ impl HardwareModel {
                 let r = c.clone();
                 s.read = Arc::new(move || {
                     let pl = r.read_package_power_limits()?;
-                    Ok(Some(if which == 1 { pl.0 } else { pl.1 }))
+                    Ok(Some(if which == 1 { pl.pl1 } else { pl.pl2 }))
                 });
                 if !locked {
                     s.write = Some(Arc::new(move |v| {
@@ -1770,14 +1770,12 @@ impl HardwareModel {
             st.package_temp_c = cpu.read_package_temperature().ok();
             if let Ok((ratio, vid)) = cpu.read_perf_status(cpu.first_p_thread()) {
                 st.core_vid = Some(vid);
-                if let Ok(max) = cpu.read_max_current_p_ratio() {
-                    let r = ratio.max(max);
-                    st.core_ratio = Some(r);
-                    st.core_mhz = Some(r as f64 * st.bclk_mhz.unwrap_or(100.0));
-                }
+                let r = ratio.max(cpu.read_max_current_p_ratio());
+                st.core_ratio = Some(r);
+                st.core_mhz = Some(r as f64 * st.bclk_mhz.unwrap_or(100.0));
             }
-            st.ring_ratio = cpu.read_current_ring_ratio().ok();
-            st.e_core_ratio = cpu.read_max_current_e_ratio().ok().flatten();
+            st.ring_ratio = Some(cpu.read_current_ring_ratio());
+            st.e_core_ratio = cpu.read_max_current_e_ratio();
             if let Ok(j) = cpu.read_package_energy_joules() {
                 st.package_watts = self.power_from_energy(j);
             }

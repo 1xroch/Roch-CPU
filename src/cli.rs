@@ -239,8 +239,8 @@ pub fn run(args: &[String]) -> i32 {
             );
             return 1;
         };
-        println!("soft reset : {}", tf(bus9.reset()));
-        println!("host reset : {}", tf(bus9.hard_reset()));
+        println!("soft reset : {}", bus9.reset().unwrap_or_else(|e| e.to_string()));
+        println!("host reset : {}", bus9.hard_reset().unwrap_or_else(|e| e.to_string()));
         for attempt in 1..=3 {
             let found = Ddr5Dimm::probe(bus.clone());
             println!(
@@ -251,7 +251,7 @@ pub fn run(args: &[String]) -> i32 {
             if !found.is_empty() {
                 break;
             }
-            bus9.reset();
+            let _ = bus9.reset();
             native::sleep_ms(300);
         }
         return 0;
@@ -1236,15 +1236,15 @@ fn probe_body(hw: &HardwareModel, w: &dyn Fn(&str)) -> anyhow::Result<()> {
             ));
         }
         let ring = cpu.read_ring_ratio()?;
-        w(&format!("Ring         : max {} min {} current {}", ring.0, ring.1, cpu.read_current_ring_ratio()?));
+        w(&format!("Ring         : max {} min {} current {}", ring.0, ring.1, cpu.read_current_ring_ratio()));
         let pl = cpu.read_package_power_limits()?;
         w(&format!(
             "Power limits : PL1 {} W (en={}) PL2 {} W (en={}) locked={}",
-            pl.0,
-            tf(pl.3),
-            pl.1,
-            tf(pl.4),
-            tf(pl.2)
+            pl.pl1,
+            tf(pl.pl1_enabled),
+            pl.pl2,
+            tf(pl.pl2_enabled),
+            tf(pl.locked)
         ));
         if hw.mailbox_available() {
             // Domain 5 is the E-core L2 rail and domain 3 the uncore, established by
@@ -1263,7 +1263,7 @@ fn probe_body(hw: &HardwareModel, w: &dyn Fn(&str)) -> anyhow::Result<()> {
         w(&format!(
             "BCLK         : {} MHz ({})",
             hw.measure_bclk().map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
-            hw.bclk().map(|b| b.status()).unwrap_or_default()
+            hw.bclk().map(|b| b.status().to_string()).unwrap_or_default()
         ));
         let _ = hw.read_live();
         native::sleep_ms(500);
@@ -1387,7 +1387,7 @@ fn probe_body(hw: &HardwareModel, w: &dyn Fn(&str)) -> anyhow::Result<()> {
         w(&format!(
             "BCLK         : {} MHz ({})",
             hw.measure_bclk().map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
-            hw.bclk().map(|b| b.status()).unwrap_or_default()
+            hw.bclk().map(|b| b.status().to_string()).unwrap_or_default()
         ));
         let _ = hw.read_live();
         native::sleep_ms(500);
