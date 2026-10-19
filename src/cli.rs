@@ -165,7 +165,7 @@ pub fn run(args: &[String]) -> i32 {
         for r in &restrictions {
             lines.push(format!(
                 "{} MSR 0x{:X} write={} driver={}",
-                r.time_utc.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                r.time_utc.format("%Y-%m-%dT%H:%M:%S%.7fZ"),
                 r.register,
                 if r.is_write { "True" } else { "False" },
                 r.driver
