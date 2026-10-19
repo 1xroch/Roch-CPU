@@ -249,7 +249,10 @@ pub fn validate(path: &Path, volts: f64) -> i32 {
     };
     let mut failures = 0;
     log(&format!("Intel validation {}; hypervisor: {}", now_o(), tf(cpu.hypervisor_present())));
-    let (sensor, sensor_status) = SuperIo::try_create(driver.clone());
+    let (sensor, sensor_status) = match SuperIo::try_create(&driver) {
+        Ok(v) => v,
+        Err(e) => (None, e.to_string()),
+    };
     log(&format!("Vcore sensor: {sensor_status}"));
     let p = cpu.first_p_thread();
 

@@ -337,7 +337,7 @@ pub fn run(args: &[String]) -> i32 {
             println!("no EC mailbox on this Super I/O");
             return 1;
         };
-        let generator = EcClockGen::new(EcMailbox::new(sio, false));
+        let generator = EcClockGen::new(EcMailbox::new(sio));
         for _ in 0..3 {
             let blk = generator.read_block();
             let mhz = match (hw.cpu(), hw.bclk().filter(|b| b.is_available())) {
@@ -345,8 +345,9 @@ pub fn run(args: &[String]) -> i32 {
                 _ => None,
             };
             match blk {
-                None => println!("  clock generator did not answer"),
-                Some(b) => println!(
+                Err(e) => println!("  {e}"),
+                Ok(None) => println!("  clock generator did not answer"),
+                Ok(Some(b)) => println!(
                     "  {}   measured {} MHz",
                     EcClockGen::describe(&b),
                     mhz.map(|v| format!("{v:.3}")).unwrap_or_default()
@@ -375,7 +376,7 @@ pub fn run(args: &[String]) -> i32 {
             println!("usage: --vdd2 <volts>   (omit to just report)");
             return 1;
         };
-        let ok = rail.set_volts(target, Some(&|m: &str| println!("{m}")));
+        let ok = rail.set_volts(target, Some(&|m: &str| println!("{m}"))).unwrap_or_else(|e| { println!("{e}"); false });
         println!("{}{}", if ok { "ok: " } else { "FAILED: " }, rail.status());
         return if ok { 0 } else { 1 };
     }
@@ -432,10 +433,13 @@ fn bclk_tools(args: &[String]) -> i32 {
 
     let thread = cpu.first_p_thread();
     let ctl = BclkController::new(
-        EcClockGen::new(EcMailbox::new(sio.clone(), false)),
+        EcClockGen::new(EcMailbox::new(sio.clone())),
         Box::new(move || meter.measure_bclk_from_cycles(thread, 150).ok().flatten()),
     );
-    if !ctl.capture_baseline() {
+    if !ctl.capture_baseline().unwrap_or_else(|e| {
+        println!("{e}");
+        false
+    }) {
         println!("{}", ctl.status());
         return 1;
     }
@@ -445,7 +449,7 @@ fn bclk_tools(args: &[String]) -> i32 {
     if eq(a0, "--clkgen-dump") {
         // Read-only sweep of the clock generator, to find what else on it moves with the
         // base clock. Word reads overlap by a byte, so the low byte of each is the map.
-        let gen_d = EcMailbox::new(sio, false);
+        let gen_d = EcMailbox::new(sio);
         let from = args.get(1).and_then(|s| i32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0x00);
         let to = args.get(2).and_then(|s| i32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0xFF);
         println!("clock generator 0x{:02X}, registers 0x{from:02X}-0x{to:02X}", EcClockGen::CLOCK_GEN_ADDRESS);
@@ -458,8 +462,8 @@ fn bclk_tools(args: &[String]) -> i32 {
                     "  ".to_string()
                 } else {
                     match gen_d.read_word(EcClockGen::CLOCK_GEN_ADDRESS, r as u8) {
-                        Some(wv) => format!("{:02X}", wv as u8),
-                        None => "--".into(),
+                        Ok(Some(wv)) => format!("{:02X}", wv as u8),
+                        _ => "--".into(),
                     }
                 });
             }
@@ -483,13 +487,13 @@ fn bclk_tools(args: &[String]) -> i32 {
                 }
             }
         }
-        let ok = ctl.probe_dividers(&divs, Some(&print));
+        let ok = ctl.probe_dividers(&divs, Some(&print)).unwrap_or_else(|e| { println!("{e}"); false });
         println!("{}{}", if ok { "" } else { "FAILED: " }, ctl.status());
         return if ok { 0 } else { 1 };
     }
 
     if eq(a0, "--bclk-cal") {
-        let ok = ctl.calibrate(Some(&print));
+        let ok = ctl.calibrate(Some(&print)).unwrap_or_else(|e| { println!("{e}"); false });
         println!("{}{}", if ok { "calibrated: " } else { "FAILED: " }, ctl.status());
         return if ok { 0 } else { 1 };
     }
@@ -500,7 +504,7 @@ fn bclk_tools(args: &[String]) -> i32 {
     };
     // No pre-calibration: set_bclk establishes the scale from its own first read, the same
     // way the Base Clock row does, so this measures what the application actually costs.
-    let set = ctl.set_bclk(want, Some(&print));
+    let set = ctl.set_bclk(want, Some(&print)).unwrap_or_else(|e| { println!("{e}"); false });
     println!("{}{}", if set { "ok: " } else { "FAILED: " }, ctl.status());
     if set { 0 } else { 1 }
 }

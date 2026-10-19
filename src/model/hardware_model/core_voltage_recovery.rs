@@ -16,7 +16,7 @@ use crate::hw::super_io::SuperIoKind;
 /// Builds the startup controller from an EC mailbox. Production always uses
 /// [`MsiCoreVoltage::try_create_for_startup`]; inert tests substitute an isolated fake.
 pub(crate) type CoreVoltageStartupFactory<'a> =
-    &'a dyn Fn(EcMailbox) -> (Option<MsiCoreVoltage>, CorePageVerificationResult);
+    &'a dyn Fn(&EcMailbox) -> (Option<MsiCoreVoltage>, CorePageVerificationResult);
 
 impl HardwareModel {
     pub fn core_voltage_initialization_result(&self) -> Option<CorePageVerificationResult> {
@@ -77,7 +77,7 @@ impl HardwareModel {
                 diagnostic_lines: Vec::new(),
             },
             None => {
-                let (control, result) = startup_factory(EcMailbox::new(self.super_io().unwrap(), false));
+                let (control, result) = startup_factory(&EcMailbox::new(self.super_io().unwrap()));
                 if let Some(c) = control {
                     let _ = self.core_voltage.set(Arc::new(c));
                 }

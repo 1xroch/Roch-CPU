@@ -493,10 +493,16 @@ impl HardwareModel {
     }
 
     fn initialize_super_io(&self, driver: &Arc<dyn KernelDriver>) {
-        let (sio, status) = SuperIo::try_create(driver.clone());
+        if let Err(e) = self.try_initialize_super_io(driver) {
+            self.emit(&format!("Super I/O error: {e}"));
+        }
+    }
+
+    fn try_initialize_super_io(&self, driver: &Arc<dyn KernelDriver>) -> Result<()> {
+        let (sio, status) = SuperIo::try_create(driver)?;
         *lock(&self.super_io_status) = status.clone();
         self.emit(&format!("Super I/O: {status}"));
-        let Some(sio) = sio else { return };
+        let Some(sio) = sio else { return Ok(()) };
         let sio = Arc::new(sio);
         let _ = self.super_io.set(sio.clone());
 
@@ -514,9 +520,11 @@ impl HardwareModel {
         // where that mailbox exists. The clock controller reads its baseline and
         // does not change the clock until a value is applied.
         if !EcMailbox::is_supported(Some(&sio)) {
-            return;
+            return Ok(());
         }
-        let mailbox = EcMailbox::new(sio.clone(), false);
+        // One mailbox instance (and so one transaction lock) shared by the clock generator and
+        // VDD2, as in the .NET model.
+        let mailbox = EcMailbox::new(sio.clone());
         if self.cpu().is_some() && msi_board(&self.smbios) {
             // One bounded core-PAGE read/restore, before constructing the target row.
             // No voltage/mode target is changed, and periodic refresh never selects PAGE.
@@ -525,20 +533,22 @@ impl HardwareModel {
         if let (Some(cpu), Some(meter)) = (self.cpu(), self.bclk().filter(|b| b.is_available())) {
             let measure = Box::new(move || meter.measure_bclk_from_cycles(cpu.first_p_thread(), 150).ok().flatten());
             let control = BclkController::new(EcClockGen::new(mailbox.clone()), measure);
-            if control.capture_baseline() {
-                self.emit(&format!("Clock generator: {}", control.status()));
+            let captured = control.capture_baseline()?;
+            let status = control.status();
+            if captured {
                 let _ = self.bclk_control.set(Arc::new(control));
-            } else {
-                self.emit(&format!("Clock generator: {}", control.status()));
             }
+            self.emit(&format!("Clock generator: {status}"));
         }
         let sio2 = sio.clone();
         let vdd2 = Vdd2Rail::new(mailbox, Box::new(move || sio2.read_voltage(SuperIo::RAIL_VDD2)));
-        let ok = vdd2.capture_baseline();
-        self.emit(&format!("CPU VDD2: {}", vdd2.status()));
+        let ok = vdd2.capture_baseline()?;
+        let status = vdd2.status();
         if ok {
             let _ = self.vdd2.set(Arc::new(vdd2));
         }
+        self.emit(&format!("CPU VDD2: {status}"));
+        Ok(())
     }
 
     fn initialize_intel(&self, driver: &Arc<dyn KernelDriver>) {
@@ -776,7 +786,7 @@ impl HardwareModel {
         let core_voltage = self.core_voltage();
         let domain_readable = |d: i32| cpu.as_ref().is_some_and(|c| c.mailbox().read_domain(d).is_ok());
 
-        let mut add_domain = |id_prefix: &str, name: &str, domain: i32, min_v: f64, max_v: f64, available: bool| {
+        let add_domain = |id_prefix: &str, name: &str, domain: i32, min_v: f64, max_v: f64, available: bool| -> [Setting; 2] {
             let row_available = available && (domain != OcMailbox::DOMAIN_CORE || !msi || core_voltage.is_some());
             let mut s = Setting::new(format!("{id_prefix}_v"), format!("{name} Voltage"), SettingGroup::Voltages);
             s.unit = "V".into();
@@ -824,7 +834,6 @@ impl HardwareModel {
                 }
             }));
             s.available = mb_ok && row_available;
-            rows.push(s);
 
             let mut o = Setting::new(format!("{id_prefix}_off"), format!("{name} Voltage Offset"), SettingGroup::Voltages);
             o.unit = "mV".into();
@@ -842,9 +851,9 @@ impl HardwareModel {
                     .unwrap_or_else(|| format!("Adaptive offset for FIVR domain {domain} (mailbox 0x150). Negative values undervolt.")),
             );
             o.available = mb_ok && available;
-            rows.push(o);
+            [s, o]
         };
-        add_domain("core", "CPU Core", OcMailbox::DOMAIN_CORE, 0.600, 1.720, mb_ok && domain_readable(OcMailbox::DOMAIN_CORE));
+        rows.extend(add_domain("core", "CPU Core", OcMailbox::DOMAIN_CORE, 0.600, 1.720, mb_ok && domain_readable(OcMailbox::DOMAIN_CORE)));
 
         if let Some(asus) = self.asus_control().filter(|a| a.baseline_svid().is_some()) {
             let index = rows.iter().position(|s| s.id == "core_v").unwrap();
@@ -889,10 +898,10 @@ impl HardwareModel {
         }
         // Not gated on the E-core count: the L2 rail for that cluster exists and is settable even
         // when the E-cores are switched off in the BIOS, which is exactly what the vendor tool shows.
-        add_domain("ecore", "CPU E-Core L2", OcMailbox::DOMAIN_ECORE, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_ECORE));
-        add_domain("ring", "Ring", OcMailbox::DOMAIN_RING, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_RING));
-        add_domain("sa", "SA", OcMailbox::DOMAIN_SA, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_SA));
-        add_domain("gt", "GT (iGPU)", OcMailbox::DOMAIN_GT, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_GT));
+        rows.extend(add_domain("ecore", "CPU E-Core L2", OcMailbox::DOMAIN_ECORE, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_ECORE)));
+        rows.extend(add_domain("ring", "Ring", OcMailbox::DOMAIN_RING, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_RING)));
+        rows.extend(add_domain("sa", "SA", OcMailbox::DOMAIN_SA, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_SA)));
+        rows.extend(add_domain("gt", "GT (iGPU)", OcMailbox::DOMAIN_GT, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_GT)));
 
         if let Some(asus) = self.asus_control() {
             let mut add_asus_rail = |prefix: &str, name: &str, id: u32, baseline: Option<SvidState>| {
@@ -974,7 +983,7 @@ impl HardwareModel {
             let (ctx, emit) = (self.ctx.clone(), self.emitter());
             let wc = c.clone();
             s.write = Some(Arc::new(move |v| {
-                if !wc.set_bclk(v, Some(&emit)) {
+                if !wc.set_bclk(v, Some(&emit))? {
                     bail!("{}", wc.status());
                 }
                 ctx.measure_bclk();
@@ -982,7 +991,7 @@ impl HardwareModel {
             }));
             let ctx = self.ctx.clone();
             s.restore_default = Some(Arc::new(move || {
-                if !c.restore() {
+                if !c.restore()? {
                     bail!("{}", c.status());
                 }
                 ctx.measure_bclk();
@@ -1361,13 +1370,13 @@ impl HardwareModel {
         if let Some(rail) = rail.clone() {
             let (w, emit) = (rail.clone(), self.emitter());
             s.write = Some(Arc::new(move |t| {
-                if !w.set_volts(t, Some(&emit)) {
+                if !w.set_volts(t, Some(&emit))? {
                     bail!("{}", w.status());
                 }
                 Ok(())
             }));
             s.restore_default = Some(Arc::new(move || {
-                if !rail.restore() {
+                if !rail.restore()? {
                     bail!("{}", rail.status());
                 }
                 Ok(())
@@ -1840,3 +1849,119 @@ fn read_curve_optimizer_with(amd: &AmdCpu, ctx: &Ctx, smu_available: bool, core:
 }
 
 use core_voltage_recovery::{clear_msi_core_override, write_msi_core_override};
+
+/// Inert construction for tests: no SMBIOS read, no driver, no detection. The setters stand in
+/// for the reflection the .NET tests used to populate a model without its production constructor.
+#[cfg(test)]
+impl HardwareModel {
+    pub(crate) fn for_test(smbios: SmbiosInfo) -> Self {
+        Self::with_smbios(smbios)
+    }
+    pub(crate) fn set_driver_for_test(&self, d: Arc<dyn KernelDriver>) {
+        let _ = self.driver.set(d);
+    }
+    pub(crate) fn set_cpu_for_test(&self, c: Arc<IntelCpu>) {
+        let _ = self.ctx.cpu.set(c);
+    }
+    pub(crate) fn set_super_io_for_test(&self, s: Arc<SuperIo>) {
+        let _ = self.super_io.set(s);
+    }
+    pub(crate) fn set_mailbox_available_for_test(&self, v: bool) {
+        self.mailbox_available.store(v, Ordering::SeqCst);
+    }
+    pub(crate) fn set_voltage_access_restriction_for_test(&self, v: Option<String>) {
+        *lock(&self.voltage_access_restriction) = v;
+    }
+    /// Runs the production Intel row builder and returns its rows without installing them.
+    pub(crate) fn build_intel_settings_for_test(&self) -> Vec<Setting> {
+        let mut rows = Vec::new();
+        self.build_intel_settings(&mut rows);
+        rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    fn model() -> HardwareModel {
+        HardwareModel::for_test(SmbiosInfo::default())
+    }
+
+    fn ratio_row() -> Setting {
+        let mut s = Setting::new("cpu_ratio", "P", SettingGroup::Clocks);
+        s.min = 8.0;
+        s.max = 120.0;
+        s
+    }
+
+    #[test]
+    fn non_finite_input_rejected() {
+        let s = Setting::new("x", "x", SettingGroup::Clocks);
+        assert!(s.try_parse("NaN").is_none() && s.try_parse("Infinity").is_none() && s.try_parse("1e999").is_none());
+    }
+
+    #[test]
+    fn failed_readback_sets_error_and_a_retry_clears_it() {
+        let hardware = Arc::new(AtomicU64::new(55f64.to_bits()));
+        let ignore = Arc::new(AtomicBool::new(true));
+        let mut s = ratio_row();
+        s.require_read_back = true;
+        let h = hardware.clone();
+        s.read = Arc::new(move || Ok(Some(f64::from_bits(h.load(Ordering::SeqCst)))));
+        let (h, i) = (hardware.clone(), ignore.clone());
+        s.write = Some(Arc::new(move |v| {
+            if !i.load(Ordering::SeqCst) {
+                h.store(v.to_bits(), Ordering::SeqCst);
+            }
+            Ok(())
+        }));
+        let hw = model();
+        hw.settings().push(s);
+        assert!(!hw.apply("cpu_ratio", 54.0) && hw.setting("cpu_ratio").unwrap().last_error.is_some(), "Ignored request reported success");
+        ignore.store(false, Ordering::SeqCst);
+        let ok = hw.apply("cpu_ratio", 54.0);
+        let row = hw.setting("cpu_ratio").unwrap();
+        assert!(ok && row.last_error.is_none() && row.current == Some(54.0), "Retry didn't recover");
+    }
+
+    #[test]
+    fn fractional_ratios_do_not_silently_round() {
+        let wrote = Arc::new(AtomicBool::new(false));
+        let mut s = ratio_row();
+        let w = wrote.clone();
+        s.write = Some(Arc::new(move |_| {
+            w.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+        let hw = model();
+        hw.settings().push(s);
+        assert!(!hw.apply("cpu_ratio", 54.5) && !wrote.load(Ordering::SeqCst), "Fractional ratio written");
+    }
+
+    #[test]
+    fn failed_refresh_cannot_verify_against_stale_cached_data() {
+        let mut s = ratio_row();
+        s.current = Some(55.0);
+        s.require_read_back = true;
+        s.write = Some(Arc::new(|_| Ok(())));
+        s.read = Arc::new(|| bail!("read failed"));
+        let hw = model();
+        hw.settings().push(s);
+        assert!(!hw.apply("cpu_ratio", 55.0) && hw.setting("cpu_ratio").unwrap().current.is_none(), "Stale cached value verified a failed read");
+    }
+
+    #[test]
+    fn reset_reports_failure_instead_of_unconditional_success() {
+        let mut s = ratio_row();
+        s.current = Some(54.0);
+        s.default_value = Some(55.0);
+        s.require_read_back = true;
+        s.write = Some(Arc::new(|_| Ok(())));
+        s.read = Arc::new(|| Ok(Some(54.0)));
+        let hw = model();
+        hw.settings().push(s);
+        assert_eq!(hw.restore_all_defaults(), 1, "Reset suppressed failure");
+    }
+}

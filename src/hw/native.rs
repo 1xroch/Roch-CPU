@@ -66,7 +66,7 @@ pub fn last_error_message() -> String {
 /// CPUID with a sub-leaf: (eax, ebx, ecx, edx).
 pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     // SAFETY: CPUID is available on every x86-64 processor.
-    let r = unsafe { std::arch::x86_64::__cpuid_count(leaf, subleaf) };
+    let r = std::arch::x86_64::__cpuid_count(leaf, subleaf);
     (r.eax, r.ebx, r.ecx, r.edx)
 }
 

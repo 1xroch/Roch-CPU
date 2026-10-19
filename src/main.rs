@@ -37,16 +37,23 @@ fn run() -> i32 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ui::run(model.clone())));
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => ui::show_error("Roch CPU - unexpected error", &format!("{e:?}")),
+        Ok(Err(e)) => show_error("Roch CPU - unexpected error", &format!("{e:?}")),
         Err(p) => {
             let msg = p
                 .downcast_ref::<String>()
                 .cloned()
                 .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_else(|| "panic".into());
-            ui::show_error("Roch CPU - unexpected error", &msg);
+            show_error("Roch CPU - unexpected error", &msg);
         }
     }
     drop(model);
     0
+}
+
+/// A modal error box (the .NET `MessageBox.Show` with the error icon).
+fn show_error(title: &str, text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    let (t, m) = (hw::native::wide(title), hw::native::wide(text));
+    unsafe { MessageBoxW(std::ptr::null_mut(), m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONERROR) };
 }
