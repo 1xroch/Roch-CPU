@@ -44,7 +44,7 @@ from the PawnIO.Modules 0.2.4 release (the same blob ZenStates-Core embeds), unm
 * SHA-256: `B84ECA7F32C63B3D8C14B2C6D45482706DF8683AA6F43EB8BEAD9DC62181D38F`
 * PawnIO itself is not bundled and is never installed by Roch CPU.
 
-The client in `Hardware/PawnIo.cs` follows the ioctl layout of LibreHardwareMonitor's and
+The client in `src/hw/pawnio.rs` follows the ioctl layout of LibreHardwareMonitor's and
 ZenStates-Core's PawnIO wrappers (32-byte function name followed by 64-bit arguments).
 
 ## ZenStates-Core, ZenStates, SMUDebugTool
@@ -55,7 +55,7 @@ The AMD path talks to the SMU the way Ivan Rusanov's
 [SMUDebugTool](https://github.com/irusanov/SMUDebugTool)) does: the RSMU / MP1 / HSMP mailbox
 addresses per generation, the message numbers, the core-address encoding for the Curve
 Optimizer and the fuse registers that give the CCD and core map were taken from it as
-reference and reimplemented in `Hardware/AmdSmu.cs` and `Hardware/AmdCpu.cs`. No ZenStates
+reference and reimplemented in `src/hw/amd_smu.rs` and `src/hw/amd_cpu.rs`. No ZenStates
 code is included. Roch CPU is itself GPL-3.0, so the two are licence-compatible either way.
 
 Where this project's measurements disagreed with the reference, the measurement won and the
@@ -76,7 +76,7 @@ PMIC over SMBus).
 the reference tuning tool was used as a reference implementation for behaviour comparison on one MSI board,
 which is how the DDR5 PMIC voltage scales and the OC mailbox domain numbering were validated.
 
-The base-clock path in `Hardware/EcClockGen.cs` and the CPU VDD2 path in `Hardware/Vdd2Rail.cs`
+The base-clock path in `src/hw/ec_clock_gen.rs` and the CPU VDD2 path in `src/hw/vdd2_rail.rs`
 were found by observing that tool's behaviour: its kernel driver's exported entry points were
 forwarded through a logging proxy while it changed the base clock and that rail, and the resulting
 port-level trace showed which registers of the board's embedded controller carry a transaction to

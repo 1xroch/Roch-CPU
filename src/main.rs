@@ -34,7 +34,7 @@ fn run() -> i32 {
 
     let model = Arc::new(HardwareModel::new());
     // A panic on the UI thread must still drop the model, so the driver service is removed.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ui::run(model.clone())));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ui::run(model.clone() as Arc<dyn ui::model::UiModel>)));
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => show_error("Roch CPU - unexpected error", &format!("{e:?}")),
@@ -46,6 +46,13 @@ fn run() -> i32 {
                 .unwrap_or_else(|| "panic".into());
             show_error("Roch CPU - unexpected error", &msg);
         }
+    }
+    // Worker threads (start-up probe, BCLK measurement) hold the model too. Give them a moment
+    // to finish so the last reference - and with it the driver service cleanup - is dropped here,
+    // not lost when the process exits.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Arc::strong_count(&model) > 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
     drop(model);
     0

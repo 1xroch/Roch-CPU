@@ -108,7 +108,7 @@ both sit on an I²C bus the embedded controller owns rather than on the PCH SMBu
 them through the mailbox that EC exposes. The register layout came from watching the vendor tool's
 driver; **the encodings did not** — those were established by measuring how the board responded,
 and reading the base clock's off the trace gives the wrong answer entirely. See
-`Hardware/EcMailbox.cs`, `EcClockGen.cs`, `BclkController.cs` and `Vdd2Rail.cs`, which carry the
+`src/hw/ec_mailbox.rs`, `ec_clock_gen.rs`, `bclk_controller.rs` and `vdd2_rail.rs`, which carry the
 detail, and [the notices](../THIRD-PARTY-NOTICES.md).
 
 A wrong value here does not produce a wrong reading, it stops the machine. So nothing is computed
@@ -132,8 +132,7 @@ change. `--bclk-test` prints all three side by side.
 ## Requirements
 
 * Windows 10/11 x64, run **as administrator** (the manifest asks for elevation).
-* [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) for current source, or build
-  self-contained.
+* No runtime: the Rust build is a single native executable.
 * `WinRing0x64.sys` beside the executable; the build copies it.
   * Windows **Memory Integrity** or the vulnerable-driver blocklist may refuse to load it. The
     window then warns and every row reads N/A.
@@ -145,11 +144,12 @@ change. `--bclk-test` prints all three side by side.
 ## Building
 
 ```bash
-build.cmd                   # dist\Roch CPU.exe, framework-dependent
-build.cmd --self-contained  # no .NET runtime needed
+build.cmd                   # dist\Roch CPU.exe plus the driver and pawnio folder
+cargo test --release        # regression checks over simulated drivers
 ```
 
-Or `dotnet publish src/RochPower -c Release -o dist`.
+Needs the stable Rust toolchain for `x86_64-pc-windows-msvc`. `cargo build --release` alone
+produces `target\release\roch-cpu.exe`; `build.cmd` renames it and copies its support files.
 
 ## Using it
 
