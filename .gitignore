@@ -16,3 +16,4 @@ apply.txt
 pmtable.txt
 *.bin
 !drivers/pawnio/RyzenSMU.bin
+target/
