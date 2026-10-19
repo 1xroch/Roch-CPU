@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, rust]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -10,18 +10,20 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      SOURCE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v6
-        with:
-          dotnet-version: '10.0.x'
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
 
       - name: Regression checks
-        run: dotnet run --project tests/RochPower.Tests/RochPower.Tests.csproj -c Release
+        # Unit tests use simulated drivers and buses; they never open the hardware driver.
+        run: cargo test --release --locked
 
       - name: Build
-        run: dotnet publish src/RochPower/RochPower.csproj -c Release -r win-x64 --self-contained false -o dist
+        run: cmd /c build.cmd
 
       - name: Check the driver travelled with the build
         shell: pwsh

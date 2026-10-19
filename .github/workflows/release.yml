@@ -38,15 +38,17 @@ jobs:
           ref: ${{ inputs.commit_sha }}
           persist-credentials: false
 
-      - uses: actions/setup-dotnet@v6
-        with:
-          dotnet-version: '10.0.x'
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
 
       - name: Regression checks
-        run: dotnet run --project tests/RochPower.Tests/RochPower.Tests.csproj -c Release
+        run: cargo test --release --locked
 
-      - name: Build self-contained Windows package
-        run: dotnet publish src/RochPower/RochPower.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o package
+      - name: Build Windows package
+        run: |
+          cmd /c build.cmd
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          Move-Item -LiteralPath dist -Destination package
 
       - name: Package and verify
         shell: pwsh
@@ -60,7 +62,7 @@ jobs:
           if ($moduleHash -ne 'B84ECA7F32C63B3D8C14B2C6D45482706DF8683AA6F43EB8BEAD9DC62181D38F') { throw 'PawnIO module hash mismatch' }
           Copy-Item -LiteralPath 'LICENSE','THIRD-PARTY-NOTICES.md' -Destination package
           Copy-Item -LiteralPath docs -Destination package -Recurse
-          $files = Get-ChildItem -LiteralPath package | Where-Object Name -NE 'Roch CPU.pdb'
+          $files = Get-ChildItem -LiteralPath package
           $zipName = "Roch-CPU-$version-win-x64.zip"
           Compress-Archive -LiteralPath $files.FullName -DestinationPath $zipName -CompressionLevel Optimal
           $hash = (Get-FileHash -LiteralPath $zipName).Hash.ToLowerInvariant()

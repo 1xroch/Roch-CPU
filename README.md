@@ -8,7 +8,7 @@ A Windows CPU and DDR5 memory tuning tool for supported Intel LGA1700 and AMD Ry
 
 1. Download the package from [Releases](https://github.com/RochStudio/Roch-CPU/releases).
 2. Extract the entire folder—keep the bundled driver and support files beside `Roch CPU.exe`.
-3. Run `Roch CPU.exe` as administrator. Current-source framework-dependent builds need the **.NET 10 Desktop Runtime (x64)**; self-contained builds do not. Older releases targeting .NET 8 still need the .NET 8 runtime.
+3. Run `Roch CPU.exe` as administrator. Builds from the current (Rust) source need no runtime. Older .NET releases need the .NET 10 (or, before that, .NET 8) Desktop Runtime unless they were self-contained.
 
 Windows 10/11 x64 is required. If Windows blocks a driver, some controls will be unavailable.
 
@@ -38,13 +38,15 @@ Left: Roch CPU 1.0.3 on an Intel Core i5-14600KF / Z790MPOWER, including the boa
 
 ## Build the latest source
 
-Install the **.NET 10 SDK**, then run:
+Roch CPU is written in Rust. Install the stable **Rust toolchain** for `x86_64-pc-windows-msvc`
+(via [rustup](https://rustup.rs), with the Visual Studio C++ build tools), then run:
 
 ```bat
-build.cmd --self-contained
+build.cmd
 ```
 
-Open `dist\Roch CPU.exe`. The current version is **1.0.6**.
+Open `dist\Roch CPU.exe`. The current version is **1.0.6**. The executable has no runtime
+dependency; keep the driver and `pawnio` folder that `build.cmd` copies beside it.
 
 ### Intel write verification
 
@@ -114,8 +116,10 @@ increase above the current ceiling, with an absolute test maximum of 44.
 Regression checks use a simulated driver and never open the hardware driver:
 
 ```bat
-dotnet run --project tests\RochPower.Tests -c Release
+cargo test --release
 ```
+
+`Roch CPU.exe --ui-preview [--dark]` opens the window with sample rows and no hardware access.
 
 > Overclocking can cause crashes, data loss or hardware damage. Change one setting at a time and test stability. Read-back checks do not prove a setting is stable.
 

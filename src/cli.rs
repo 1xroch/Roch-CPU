@@ -908,9 +908,9 @@ fn smu_command(a: &[String]) -> i32 {
     let smu = amd.smu();
     let msgs = smu.messages();
     let mb = match a[0].to_lowercase().as_str() {
-        "rsmu" => msgs.rsmu.clone(),
-        "mp1" => msgs.mp1.clone(),
-        "hsmp" => msgs.hsmp.clone(),
+        "rsmu" => Some(msgs.rsmu),
+        "mp1" => Some(msgs.mp1),
+        "hsmp" => Some(msgs.hsmp),
         _ => None,
     };
     let Some(mb) = mb else {
@@ -937,7 +937,7 @@ fn smu_command(a: &[String]) -> i32 {
         mb.name,
         mb.msg,
         AmdSmu::describe(st),
-        st as u8,
+        st.code(),
         margs.iter().map(|x| format!("0x{x:08X}")).collect::<Vec<_>>().join(" ")
     );
     println!("{line}");
@@ -1352,7 +1352,7 @@ fn probe_body(hw: &HardwareModel, w: &dyn Fn(&str)) -> anyhow::Result<()> {
                 smu.table_version(),
                 smu.table_address(),
                 smu.table_size(),
-                smu.layout().map(|l| l.name.clone()).unwrap_or_else(|| "unknown".into())
+                smu.layout().map(|l| l.name.to_string()).unwrap_or_else(|| "unknown".into())
             ));
             if let Some(t) = if smu.refresh_table() { smu.table() } else { None } {
                 w(&format!(

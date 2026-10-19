@@ -58,6 +58,11 @@ pub trait KernelDriver: Send + Sync {
 
     /// PCI configuration space read (legacy 256-byte space). `None` if the device is absent.
     fn read_pci_config(&self, bus: u8, device: u8, function: u8, offset: u16) -> Option<u32>;
+    /// PCI configuration read that only reports whether the driver call itself succeeded, so an
+    /// all-ones value comes back as `Some(0xFFFF_FFFF)` (a legal SMN data value on AMD).
+    fn read_pci_config_raw(&self, bus: u8, device: u8, function: u8, offset: u16) -> Option<u32> {
+        self.read_pci_config(bus, device, function, offset)
+    }
     fn write_pci_config(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32) -> bool;
 
     /// Downcasting hook, so diagnostics can reach driver-specific calls (refcount, version).

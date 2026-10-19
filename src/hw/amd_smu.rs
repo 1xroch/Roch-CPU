@@ -670,15 +670,9 @@ impl AmdSmu {
         if !self.drv.write_pci_config(0, 0, 0, SMN_INDEX, address) {
             return None;
         }
-        // The driver client calls all-ones "absent"; here it is a legal value. The trait folds a
-        // failed read and an all-ones read into `None`, so a `None` that did not come with a new
-        // driver error is taken as the all-ones value.
-        let before = self.drv.last_error();
-        match self.drv.read_pci_config(0, 0, 0, SMN_DATA) {
-            Some(v) => Some(v),
-            None if self.drv.last_error() == before => Some(0xFFFF_FFFF),
-            None => None,
-        }
+        // The driver client calls all-ones "absent"; here it is a legal value, so the raw read
+        // (which only fails when the driver call fails) is used.
+        self.drv.read_pci_config_raw(0, 0, 0, SMN_DATA)
     }
 
     fn smn_write_no_lock(&self, address: u32, value: u32) -> bool {
@@ -1365,6 +1359,16 @@ pub(crate) mod fake {
             let v = st.regs.get(&st.index).copied().unwrap_or(0);
             // Like WinRing0: all-ones is reported as "absent".
             (v != 0xFFFF_FFFF).then_some(v)
+        }
+        fn read_pci_config_raw(&self, bus: u8, device: u8, function: u8, offset: u16) -> Option<u32> {
+            assert_eq!((bus, device, function, offset), (0, 0, 0, 0x64));
+            let mut st = lock(&self.state);
+            if st.fail_reads {
+                st.errors += 1;
+                st.last_error = Some(format!("read failed #{}", st.errors));
+                return None;
+            }
+            Some(st.regs.get(&st.index).copied().unwrap_or(0))
         }
         fn write_pci_config(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32) -> bool {
             assert_eq!((bus, device, function), (0, 0, 0));

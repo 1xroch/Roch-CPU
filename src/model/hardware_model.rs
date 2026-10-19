@@ -437,13 +437,9 @@ impl HardwareModel {
                 self.initialize_intel(&driver);
             }
 
-            match BclkMeter::new(driver.clone()) {
-                Ok(b) => {
-                    self.emit(&format!("BCLK: {}", b.status()));
-                    let _ = self.ctx.bclk.set(Arc::new(b));
-                }
-                Err(e) => self.emit(&format!("BCLK meter error: {e}")),
-            }
+            let b = BclkMeter::new(driver.clone());
+            self.emit(&format!("BCLK: {}", b.status()));
+            let _ = self.ctx.bclk.set(Arc::new(b));
 
             self.initialize_smbus(&driver);
             self.initialize_super_io(&driver);
@@ -668,34 +664,38 @@ impl HardwareModel {
                 self.emit(&format!("Platform sustained limits: {power} W, {temp} C"));
             }
 
-            let (located, ts) = smu.locate_table();
-            if located {
-                self.emit(&format!("SMU {ts}"));
-                let module = native::app_dir().join("pawnio").join("RyzenSMU.bin");
-                let (pawn, ps) = smu.try_attach_pawn_io(&module);
-                self.emit(&format!("Power table: {ps}"));
-                if !pawn {
-                    self.emit("PPT/TDC/EDC rows show Auto (the BIOS value is not readable) until a value is written here.");
-                } else if !smu.refresh_table() {
-                    self.emit(&format!("Power table read failed: {}", smu.last_table_error().unwrap_or_default()));
-                } else if let Some(layout) = smu.layout() {
-                    self.emit(&format!(
-                        "Limits in force from the table ({}): PPT {} W (drawing {:.1}), TDC {} A (drawing {:.1}), EDC {} A (drawing {:.1}), Tctl max {} C, socket {:.1} W",
-                        layout.name,
-                        optq(smu.ppt_limit()),
-                        smu.ppt_value().unwrap_or(0.0),
-                        optq(smu.tdc_limit()),
-                        smu.tdc_value().unwrap_or(0.0),
-                        optq(smu.edc_limit()),
-                        smu.edc_value().unwrap_or(0.0),
-                        optq(smu.thm_limit()),
-                        smu.socket_power().unwrap_or(0.0)
-                    ));
-                } else {
-                    self.emit("The limit positions in this table version are not known; PPT/TDC/EDC rows show Auto until written.");
+            match smu.locate_table() {
+                Ok(ts) => {
+                    self.emit(&format!("SMU {ts}"));
+                    let module = native::app_dir().join("pawnio").join("RyzenSMU.bin");
+                    let attached = smu.try_attach_pawn_io(&module);
+                    let pawn = attached.is_ok();
+                    let ps = match attached {
+                        Ok(s) | Err(s) => s,
+                    };
+                    self.emit(&format!("Power table: {ps}"));
+                    if !pawn {
+                        self.emit("PPT/TDC/EDC rows show Auto (the BIOS value is not readable) until a value is written here.");
+                    } else if !smu.refresh_table() {
+                        self.emit(&format!("Power table read failed: {}", smu.last_table_error().unwrap_or_default()));
+                    } else if let Some(layout) = smu.layout() {
+                        self.emit(&format!(
+                            "Limits in force from the table ({}): PPT {} W (drawing {:.1}), TDC {} A (drawing {:.1}), EDC {} A (drawing {:.1}), Tctl max {} C, socket {:.1} W",
+                            layout.name,
+                            optq(smu.ppt_limit()),
+                            smu.ppt_value().unwrap_or(0.0),
+                            optq(smu.tdc_limit()),
+                            smu.tdc_value().unwrap_or(0.0),
+                            optq(smu.edc_limit()),
+                            smu.edc_value().unwrap_or(0.0),
+                            optq(smu.thm_limit()),
+                            smu.socket_power().unwrap_or(0.0)
+                        ));
+                    } else {
+                        self.emit("The limit positions in this table version are not known; PPT/TDC/EDC rows show Auto until written.");
+                    }
                 }
-            } else {
-                self.emit(&format!("SMU power table: {ts}"));
+                Err(ts) => self.emit(&format!("SMU power table: {ts}")),
             }
             Ok(())
         })();
@@ -1017,7 +1017,7 @@ impl HardwareModel {
     // ------------------------------------------------------------------ AMD rows
     fn build_amd_settings(&self, rows: &mut Vec<Setting>) {
         let amd = self.amd().unwrap();
-        let msgs = amd.smu().messages().clone();
+        let msgs = *amd.smu().messages();
         let live = self.smu_available();
         let pbo = live && self.pbo_allowed();
         let pbo_note = if pbo {
@@ -1225,7 +1225,7 @@ impl HardwareModel {
             rows.push(s);
         }
         {
-            let range = msgs.co_range();
+            let range = msgs.co_range;
             let mut s = Setting::new("co_all", "Curve Optimizer (all cores)", SettingGroup::Pbo);
             s.min = -(range as f64);
             s.max = range as f64;
@@ -1402,7 +1402,7 @@ impl HardwareModel {
             if dimm.vdd_verified() {
                 let d = dimm.clone();
                 s.write = Some(Arc::new(move |v| d.write_vdd(v)));
-                s.limit_note = Some(Ddr5Dimm::step_limit_note(dimm.vdd_step_mv()));
+                s.limit_note = Some(Ddr5Dimm::step_limit_note(dimm.vdd_step_mv()).to_string());
             }
             s.note = Some(format!(
                 "VDD set-point on the PMIC of {slot} (0x{:02X}, {}), register step {}.{}{}",
@@ -1425,7 +1425,7 @@ impl HardwareModel {
             if dimm.vddq_verified() {
                 let d = dimm.clone();
                 s.write = Some(Arc::new(move |v| d.write_vddq(v)));
-                s.limit_note = Some(Ddr5Dimm::step_limit_note(dimm.vddq_step_mv()));
+                s.limit_note = Some(Ddr5Dimm::step_limit_note(dimm.vddq_step_mv()).to_string());
             }
             s.note = Some(format!(
                 "VDDQ set-point (PMIC SWC rail), register step {}.{}{}",

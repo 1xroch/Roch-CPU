@@ -313,13 +313,16 @@ impl KernelDriver for WinRing0Driver {
     }
 
     fn read_pci_config(&self, bus: u8, device: u8, function: u8, offset: u16) -> Option<u32> {
+        self.read_pci_config_raw(bus, device, function, offset).filter(|&v| v != 0xFFFF_FFFF)
+    }
+
+    fn read_pci_config_raw(&self, bus: u8, device: u8, function: u8, offset: u16) -> Option<u32> {
         let mut input = [0u8; 8];
         input[..4].copy_from_slice(&Self::pci_address(bus, device, function).to_le_bytes());
         input[4..].copy_from_slice(&(offset as u32).to_le_bytes());
         let mut out = [0u8; 4];
         let ok = self.ioctl(IOCTL_READ_PCI_CONFIG, &input, &mut out);
-        let v = u32::from_le_bytes(out);
-        (ok && v != 0xFFFF_FFFF).then_some(v)
+        ok.then(|| u32::from_le_bytes(out))
     }
 
     fn write_pci_config(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32) -> bool {
