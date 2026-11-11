@@ -1104,7 +1104,6 @@ impl HardwareModel {
                          max: f64,
                          label: &'static str,
                          limit: Field,
-                         value: Field,
                          write: Write,
                          writable: bool,
                          stock: Option<f64>,
@@ -1126,16 +1125,6 @@ impl HardwareModel {
                 }
                 Ok(lock(&ctx.last_written).get(id).copied())
             });
-            // What the CPU is drawing against each limit; only where the table itself can be read.
-            if live && smu_layout_known {
-                let (a, ctx) = (amd.clone(), self.ctx.clone());
-                s.live = Some(Arc::new(move || {
-                    if !ctx.table_fresh() {
-                        return None;
-                    }
-                    value(&a).filter(|f| *f >= 0.0).map(|f| f as f64)
-                }));
-            }
             if live && writable {
                 let (a, ctx) = (amd.clone(), self.ctx.clone());
                 s.write = Some(Arc::new(move |v| {
@@ -1177,7 +1166,6 @@ impl HardwareModel {
             2000.0,
             "PPT",
             |a| a.smu().ppt_limit(),
-            |a| a.smu().ppt_value(),
             |a, v| a.smu().set_ppt(v),
             msgs.has_power_limits(),
             stock.0,
@@ -1194,7 +1182,6 @@ impl HardwareModel {
             2000.0,
             "TDC",
             |a| a.smu().tdc_limit(),
-            |a| a.smu().tdc_value(),
             |a, v| a.smu().set_tdc(v),
             msgs.has_current_limits(),
             stock.1,
@@ -1211,7 +1198,6 @@ impl HardwareModel {
             2000.0,
             "EDC",
             |a| a.smu().edc_limit(),
-            |a| a.smu().edc_value(),
             |a, v| a.smu().set_edc(v),
             msgs.has_current_limits(),
             stock.2,
@@ -1228,7 +1214,6 @@ impl HardwareModel {
             115.0,
             "Tctl max",
             |a| a.smu().thm_limit(),
-            |a| a.smu().thm_value(),
             |a, v| a.smu().set_tctl_max(v),
             msgs.rsmu_set_tctl_max != 0,
             None,

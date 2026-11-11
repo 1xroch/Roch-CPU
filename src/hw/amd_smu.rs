@@ -1241,9 +1241,6 @@ impl AmdSmu {
     pub fn thm_limit(&self) -> Option<f32> {
         self.with_layout(|s, l| Self::limit(s, "tctl", l.thm_limit))
     }
-    pub fn thm_value(&self) -> Option<f32> {
-        self.with_layout(|s, l| Self::field(s, l.thm_value))
-    }
     pub fn socket_power(&self) -> Option<f32> {
         self.with_layout(|s, l| Self::field(s, l.socket_power))
     }
