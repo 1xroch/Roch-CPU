@@ -6,7 +6,7 @@ A Windows CPU and DDR5 memory tuning tool for supported Intel LGA1700 and AMD Ry
 
 ## Install
 
-1. Download the package from [Releases](https://github.com/RochStudio/Roch-CPU/releases).
+1. Download the package from [Releases](https://github.com/1xroch/Roch-CPU/releases).
 2. Extract the entire folder—keep the bundled driver and support files beside `Roch CPU.exe`.
 3. Run `Roch CPU.exe` as administrator. Builds from the current (Rust) source need no runtime. Older .NET releases need the .NET 10 (or, before that, .NET 8) Desktop Runtime unless they were self-contained.
 
@@ -146,7 +146,7 @@ cargo test --release
 - **namazso — [PawnIO](https://pawnio.eu) and [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules):** optional driver access and the bundled signed RyzenSMU module for AMD power-table reads.
 - **[ryzen_smu](https://gitlab.com/leogx9r/ryzen_smu):** AMD SMN access reference.
 
-Created by **Roch Studio / [@MateoPCTech](https://x.com/MateoPCTech)**. See [third-party notices](THIRD-PARTY-NOTICES.md) for attribution, component licenses and implementation details.
+Created by **Roch Studio / [@1xroch](https://x.com/1xroch)**. See [third-party notices](THIRD-PARTY-NOTICES.md) for attribution, component licenses and implementation details.
 
 [YouTube](https://www.youtube.com/@MateoPcTech) | [X](https://x.com/1xroch) | [Discord](https://discord.gg/KfzExpKQHB)
 
