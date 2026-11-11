@@ -559,6 +559,14 @@ impl MainWindow {
             });
         }
         if let Some(lb) = self.model.last_bclk() {
+            // The measurement wanders by a few hundredths of a MHz every refresh (99.96, 100.02...),
+            // which made the box change on its own. Show a new reading only when it moves by more
+            // than that noise: a real change (an Apply, the BIOS, another tool) still shows.
+            const BCLK_DISPLAY_NOISE_MHZ: f64 = 0.25;
+            let shown = self.settings.iter().find(|s| s.id == "bclk").and_then(|s| s.current);
+            if shown.is_some_and(|s| (s - lb).abs() <= BCLK_DISPLAY_NOISE_MHZ) {
+                return;
+            }
             if self.rows.iter().any(|r| r == "bclk") && self.focused != Some(BoxKey::Row("bclk".into())) {
                 self.model.set_current("bclk", Some(lb));
                 if let Some(row) = self.settings.iter_mut().find(|s| s.id == "bclk") {

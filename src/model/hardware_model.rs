@@ -918,7 +918,11 @@ impl HardwareModel {
         rows.extend(add_domain("ecore", "CPU E-Core L2", OcMailbox::DOMAIN_ECORE, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_ECORE)));
         rows.extend(add_domain("ring", "Ring", OcMailbox::DOMAIN_RING, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_RING)));
         rows.extend(add_domain("sa", "SA", OcMailbox::DOMAIN_SA, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_SA)));
-        rows.extend(add_domain("gt", "GT (iGPU)", OcMailbox::DOMAIN_GT, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_GT)));
+        // No GT rows without an integrated GPU: "F" parts (i5-14600KF and the like) have none, so
+        // the GT domain is an empty slot and the rows only showed a meaningless Auto.
+        if cpu.as_ref().is_none_or(|c| c.has_integrated_graphics()) {
+            rows.extend(add_domain("gt", "GT (iGPU)", OcMailbox::DOMAIN_GT, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_GT)));
+        }
 
         if let Some(asus) = self.asus_control() {
             let mut add_asus_rail = |prefix: &str, name: &str, id: u32, baseline: Option<SvidState>| {

@@ -424,6 +424,21 @@ impl IntelCpu {
         Ok((ratios, cores))
     }
 
+    /// False for "F" parts (i5-14600KF, i7-13700F...), which have no integrated GPU: Intel marks
+    /// them with an F in the model-number suffix of the brand string.
+    pub fn has_integrated_graphics(&self) -> bool {
+        !Self::brand_says_no_igpu(&self.brand_string)
+    }
+
+    fn brand_says_no_igpu(brand: &str) -> bool {
+        // The model number is the token with a digit after "-", e.g. "i5-14600KF"; its suffix is
+        // the letters after the last digit.
+        brand.split_whitespace().filter(|t| t.contains('-') && t.chars().any(|c| c.is_ascii_digit())).any(|t| {
+            let suffix: String = t.chars().rev().take_while(|c| c.is_ascii_alphabetic()).collect();
+            suffix.chars().any(|c| c.eq_ignore_ascii_case(&'F'))
+        })
+    }
+
     /// The first logical CPU of each physical P-core, in core order (one per core: Hyper-Threading
     /// siblings share the core's ratio ceiling).
     pub fn p_core_threads(&self) -> Vec<i32> {
@@ -988,6 +1003,15 @@ mod tests {
         let c = cpu(&d);
         assert!(c.write_p_core_all_core_ratio(55).is_err());
         assert!(d.state().registers[&0x1AD] == 0x3232_3232_3232_3232, "Partial table write not restored");
+    }
+
+    #[test]
+    fn f_parts_have_no_integrated_graphics() {
+        assert!(IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) i5-14600KF"));
+        assert!(IntelCpu::brand_says_no_igpu("13th Gen Intel(R) Core(TM) i5-13400F"));
+        assert!(!IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) i9-14900K"));
+        assert!(!IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) i9-14900KS"));
+        assert!(!IntelCpu::brand_says_no_igpu("12th Gen Intel(R) Core(TM) i7-12700"));
     }
 
     #[test]
