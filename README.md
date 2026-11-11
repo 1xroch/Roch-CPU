@@ -21,12 +21,13 @@ Windows 10/11 x64 is required. If Windows blocks a driver, some controls will be
 - **Fixed: a VDD write could raise VDDQ.** VDD was copied into PMIC register `0x23` whenever it was non-zero; on `8A12` kits that register is the VDDQ extension. It is now only mirrored when it really is a second VDD phase.
 - **Safer hardware timing:** embedded-controller and SMBus polling waits at least 8 ms per poll again, as the .NET build did (the Rust port had been polling about seven times faster). Failed ratio changes now roll back the table, the core ratio and every per-core limit.
 - **Interface:** header values in red; the live readout line, the Ring Voltage rows (the ring runs on the Vcore rail, so Dragon Power has none) and the read-only CPU AUX row are gone; no confirmation prompts on voltages; the window fits the monitor's work area; Apply in the per-core window runs in the background.
+- **AMD:** the PPT, TDC, EDC and Tctl max rows show their limits only; the live draw readout beside each was removed. Tested on Ryzen with this build.
 - **Diagnostics:** `--apply` takes several `row value` pairs in one run; `--probe` lists every core's ratio limit and the E-core clusters; `--vr-page1` reads the MSI core regulator's second output.
 
 ## Features
 
 - **Intel tuning:** P-core, E-core and ring ratios, per-core and per-E-core-cluster ratios, voltage offsets/overrides, and PL1/PL2 power limits. BIOS locks and CPU/chipset restrictions still apply; a ratio the BIOS caps (for example x54 on the tested Z790MPOWER) cannot be raised from Windows.
-- **AMD Ryzen tuning:** PPT, TDC, EDC, thermal limit, PBO scalar and supported FMax controls through the SMU. With PawnIO installed, each limit row also shows the live draw (watts, amps, temperature); without it the app says so and links to pawnio.eu.
+- **AMD Ryzen tuning:** PPT, TDC, EDC, thermal limit, PBO scalar and supported FMax controls through the SMU. With PawnIO installed, the PPT/TDC/EDC rows read back the limits in force from the SMU power table; without it the app says so and links to pawnio.eu.
 - **Per-core Curve Optimizer:** edit individual AMD core offsets, refresh hardware readings and apply changes from a dedicated window.
 - **DDR5 memory voltages:** per-DIMM VDD, VDDQ and VPP controls where the PMIC permits writes, with calibration and read-back checks against the PMIC's own ADC. Sync DIMMs sets matching rails together. VDD/VDDQ 0.800-2.500 V, VPP 1.500-2.135 V, within what each PMIC register can hold.
 - **Board-specific controls:** CPU Core override, base clock and CPU VDD2 on supported MSI Intel 600/700-series boards. Core override updates both the Renesas regulator and Intel OC mailbox, with read-back and rail verification. AMD BCLK writing is not enabled on the tested B850MPOWER.
@@ -45,7 +46,7 @@ Controls vary by processor, motherboard, BIOS and driver access. Optional [PawnI
   <img src="screenshot-amd.png" alt="Roch CPU AMD Ryzen tuning controls" width="360">
 </p>
 
-Left: Roch CPU 1.0.7 on an Intel Core i5-14600KF (6P + 8E) / Z790MPOWER, with the board-backed Core override, CPU VDD2 and synced DDR5 targets. Right: Roch CPU 1.0.5 on an AMD Ryzen 7 9850X3D / X870 AORUS TACHYON ICE in the default light theme, with the AGESA version, measured base clock and live PPT/TDC/EDC/temperature readings (PawnIO installed). Available rows follow the detected hardware. Displayed settings are examples, not tuning recommendations.
+Left: Roch CPU 1.0.7 on an Intel Core i5-14600KF (6P + 8E) / Z790MPOWER, with the board-backed Core override, CPU VDD2 and synced DDR5 targets. Right: Roch CPU 1.0.5 on an AMD Ryzen 7 9850X3D / X870 AORUS TACHYON ICE in the default light theme, with the AGESA version and measured base clock (PawnIO installed; 1.0.5 still showed the live draw beside each limit, which 1.0.7 removes). Available rows follow the detected hardware. Displayed settings are examples, not tuning recommendations.
 
 ## Build the latest source
 
