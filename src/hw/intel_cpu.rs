@@ -1,13 +1,31 @@
 //! Intel hybrid (Alder Lake / Raptor Lake, LGA1700) CPU access through MSRs.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, bail};
 
 use super::KernelDriver;
 use super::native::{self, cpuid};
 use super::oc_mailbox::OcMailbox;
+
+/// The current CPU's L2 sharing group: its x2APIC ID with the bits that address CPUs sharing the
+/// same L2 cache shifted out (CPUID leaf 4 sub-leaf for the level-2 cache, EAX bits 25:14).
+fn l2_cluster_key() -> u32 {
+    let (_, _, _, apic) = cpuid(0xB, 0);
+    for sub in 0..8 {
+        let (eax, _, _, _) = cpuid(4, sub);
+        if eax & 0x1F == 0 {
+            break;
+        }
+        if (eax >> 5) & 7 == 2 {
+            let sharing = ((eax >> 14) & 0xFFF) + 1;
+            let shift = 32 - (sharing - 1).leading_zeros();
+            return apic >> shift;
+        }
+    }
+    apic >> 3
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalCpu {
@@ -46,6 +64,8 @@ pub struct IntelCpu {
     is_hybrid: bool,
     hypervisor_present: bool,
     logical_cpus: Vec<LogicalCpu>,
+    /// E-core clusters, worked out once on first use (CPUID on each E-core; never changes).
+    e_clusters: OnceLock<Vec<Vec<i32>>>,
     p_core_count: i32,
     e_core_count: i32,
     first_p_thread: i32,
@@ -162,6 +182,7 @@ impl IntelCpu {
             is_hybrid,
             hypervisor_present,
             logical_cpus,
+            e_clusters: OnceLock::new(),
             p_core_count,
             e_core_count,
             first_p_thread,
@@ -193,6 +214,7 @@ impl IntelCpu {
             is_hybrid: false,
             hypervisor_present: false,
             logical_cpus: Vec::new(),
+            e_clusters: OnceLock::new(),
             p_core_count: 0,
             e_core_count: 0,
             first_p_thread: 0,
@@ -402,26 +424,139 @@ impl IntelCpu {
         Ok((ratios, cores))
     }
 
+    /// The first logical CPU of each physical P-core, in core order (one per core: Hyper-Threading
+    /// siblings share the core's ratio ceiling).
+    pub fn p_core_threads(&self) -> Vec<i32> {
+        let mut seen = HashSet::new();
+        self.logical_cpus.iter().filter(|c| c.is_p_core && seen.insert(c.core_id)).map(|c| c.index).collect()
+    }
+
+    /// E-core clusters: the E-core logical CPUs that share an L2 cache (CPUID leaf 4), in order.
+    /// Intel E-cores run one clock per cluster of four, and the ratio ceiling set on any of them
+    /// applies to the whole cluster (on the i5-14600KF, 0x1D on E-core 6 moved E-cores 6-9 only).
+    pub fn e_core_clusters(&self) -> Vec<Vec<i32>> {
+        self.e_clusters
+            .get_or_init(|| {
+                let mut clusters: Vec<(u32, Vec<i32>)> = Vec::new();
+                for c in self.logical_cpus.iter().filter(|c| !c.is_p_core) {
+                    let key = native::run_on_cpu(c.index, l2_cluster_key).unwrap_or(c.apic_id >> 3);
+                    match clusters.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, v)) => v.push(c.index),
+                        None => clusters.push((key, vec![c.index])),
+                    }
+                }
+                clusters.into_iter().map(|(_, v)| v).collect()
+            })
+            .clone()
+    }
+
+    /// Each E-core cluster's ratio ceiling (mailbox 0x1C on its first E-core).
+    pub fn read_e_cluster_ratio_ceilings(&self) -> Vec<Option<i32>> {
+        self.e_core_clusters()
+            .iter()
+            .map(|cl| OcMailbox::new(self.drv.clone(), cl[0]).read_core_ratio_ceiling())
+            .collect()
+    }
+
+    /// One ratio per E-core cluster, in `e_core_clusters` order. The E-core turbo table is raised
+    /// to the highest value first if it is below it, as for the P-cores.
+    pub fn write_e_cluster_ratio_ceilings(&self, ratios: &[i32]) -> Result<()> {
+        let clusters = self.e_core_clusters();
+        if ratios.len() != clusters.len() {
+            bail!("Expected one ratio per E-core cluster ({}), got {}.", clusters.len(), ratios.len());
+        }
+        if ratios.iter().any(|r| !(8..=120).contains(r)) {
+            bail!("Every E-core cluster needs a ratio between 8 and 120.");
+        }
+        let top = ratios.iter().copied().max().unwrap_or(0);
+        let (table, _) = self.read_e_core_turbo_table()?;
+        if table.iter().any(|&r| r > 0 && r != top) {
+            let raised: Vec<i32> = table.iter().map(|&r| if r == 0 { 0 } else { top }).collect();
+            self.write_e_core_turbo_table(&raised)?;
+        }
+        for (cl, r) in clusters.iter().zip(ratios) {
+            OcMailbox::new(self.drv.clone(), cl[0]).set_core_ratio_ceiling(*r)?;
+        }
+        Ok(())
+    }
+
+    /// Each P-core's own ratio ceiling (mailbox 0x1C on that core), in `p_core_threads` order.
+    pub fn read_p_core_ratio_ceilings(&self) -> Vec<Option<i32>> {
+        self.p_core_threads().into_iter().map(|t| OcMailbox::new(self.drv.clone(), t).read_core_ratio_ceiling()).collect()
+    }
+
+    /// Per physical core ratios, the way MSI Dragon Power's "Per Core Ratio" works: each P-core's
+    /// own ratio ceiling (mailbox 0x1D run on that core). One value per P-core, in
+    /// `p_core_threads` order. The turbo table still bounds the result, so its entries are raised
+    /// to the highest per-core value first if they are below it.
+    pub fn write_p_core_ratio_ceilings(&self, ratios: &[i32]) -> Result<()> {
+        let threads = self.p_core_threads();
+        if ratios.len() != threads.len() {
+            bail!("Expected one ratio per P-core ({}), got {}.", threads.len(), ratios.len());
+        }
+        if ratios.iter().any(|r| !(8..=120).contains(r)) {
+            bail!("Every P-core needs a ratio between 8 and 120.");
+        }
+        let top = ratios.iter().copied().max().unwrap_or(0);
+        // The table, domain 0 and every core's ceiling go to the highest per-core value first
+        // (always: skipping it when the table already matched left a lower domain-0 ratio, set by
+        // another tool, capping every core), then each core is set to its own value.
+        self.write_p_core_turbo_table(&[top; 8])?;
+        for (t, r) in threads.iter().zip(ratios) {
+            OcMailbox::new(self.drv.clone(), *t).set_core_ratio_ceiling(*r)?;
+        }
+        Ok(())
+    }
+
     pub fn write_p_core_turbo_table(&self, ratios: &[i32]) -> Result<()> {
         let v = Self::encode_ratios(ratios)?;
         let before = self.read_or_throw(Self::MSR_TURBO_RATIO_LIMIT, self.first_p_thread)?;
+        // Captured before anything is written, so a failure part-way through can put all three
+        // places back, not just the table.
+        let domain_before = self.mailbox.read_domain(OcMailbox::DOMAIN_CORE).ok();
+        let ceilings_before: Vec<(i32, Option<i32>)> = self
+            .p_core_threads()
+            .into_iter()
+            .map(|t| (t, OcMailbox::new(self.drv.clone(), t).read_core_ratio_ceiling()))
+            .collect();
         self.write_verified(Self::MSR_TURBO_RATIO_LIMIT, v, self.first_p_thread)?;
         // The OC mailbox carries its own ceiling for the core domain; raise it when the table goes above it.
         let wanted = ratios.iter().copied().max().unwrap_or(0);
         let ceiling = (|| -> Result<()> {
             let mut d = self.mailbox.read_domain(OcMailbox::DOMAIN_CORE)?;
-            if d.max_ratio > 0 && d.max_ratio < wanted {
+            // MSI Dragon Power sets the domain-0 ratio and the core ratio ceiling (mailbox
+            // 0x1C/0x1D) to exactly the requested maximum, down as well as up; a register snapshot
+            // of its "CPU Ratio 50" showed 0x1AD, domain 0 and 0x1C all at x50. Do the same so
+            // the three never disagree.
+            if d.max_ratio > 0 && d.max_ratio != wanted {
                 d.max_ratio = wanted;
                 self.mailbox.write_domain(OcMailbox::DOMAIN_CORE, &d)?;
+            }
+            // The ceiling is per core (it answers for the core the command runs on: P-core 0 read
+            // x54 while P-cores 1-5 read x55), so set it on every P-core, not just the first.
+            for t in self.p_core_threads() {
+                OcMailbox::new(self.drv.clone(), t).set_core_ratio_ceiling(wanted)?;
             }
             Ok(())
         })();
         if let Err(ex) = ceiling {
-            let restored = self.drv.write_msr(Self::MSR_TURBO_RATIO_LIMIT, before, self.first_p_thread)
+            let mut restored = self.drv.write_msr(Self::MSR_TURBO_RATIO_LIMIT, before, self.first_p_thread)
                 && self.drv.read_msr(Self::MSR_TURBO_RATIO_LIMIT, self.first_p_thread).is_some_and(|a| a == before);
+            if let Some(d) = &domain_before {
+                restored &= self.mailbox.write_domain(OcMailbox::DOMAIN_CORE, d).is_ok();
+            }
+            for (t, c) in &ceilings_before {
+                if let Some(c) = c.filter(|&c| c > 0) {
+                    restored &= OcMailbox::new(self.drv.clone(), *t).set_core_ratio_ceiling(c).is_ok();
+                }
+            }
             bail!(
                 "OC mailbox ceiling could not be verified: {ex}{}",
-                if restored { " Previous turbo table restored." } else { " Turbo-table restore could not be verified." }
+                if restored {
+                    " Previous turbo table, core ratio and per-core limits restored."
+                } else {
+                    " Restoring the previous ratios could not be verified everywhere."
+                }
             );
         }
         Ok(())
@@ -445,7 +580,51 @@ impl IntelCpu {
             }
             v |= (ratios[i] as u64) << (8 * i);
         }
-        self.write_verified(Self::MSR_ATOM_TURBO_RATIO_LIMIT, v, self.first_e_thread)
+        // MSR 0x650 is per E-core cluster, not per package: written on the first E-core only, the
+        // i5-14600KF's second four-core cluster stayed at x40 while the first went to x41. Write
+        // it, and the E-core ratio ceiling below, on every E-core thread; first one first, so a
+        // rejected value fails before anything else has changed.
+        let mut e_threads: Vec<i32> = self.logical_cpus.iter().filter(|c| !c.is_p_core).map(|c| c.index).collect();
+        e_threads.sort_by_key(|&t| t != self.first_e_thread);
+        let wanted = ratios.iter().copied().max().unwrap_or(0);
+        let ceilings_before: Vec<(i32, Option<i32>)> = e_threads
+            .iter()
+            .map(|&t| (t, OcMailbox::new(self.drv.clone(), t).read_core_ratio_ceiling()))
+            .collect();
+        let mut written: Vec<(i32, u64)> = Vec::new();
+        let r: Result<()> = (|| {
+            for &t in &e_threads {
+                let before = self.read_or_throw(Self::MSR_ATOM_TURBO_RATIO_LIMIT, t)?;
+                written.push((t, before));
+                self.write_verified(Self::MSR_ATOM_TURBO_RATIO_LIMIT, v, t)?;
+            }
+            // The core ratio ceiling (mailbox 0x1C/0x1D) is per core type: read on an E-core it
+            // returns the E-core ceiling (0x2828, x40 on the i5-14600KF). Set it from each E-core
+            // so ratios above the fused x40 are not capped there, as for the P-cores.
+            for &t in &e_threads {
+                OcMailbox::new(self.drv.clone(), t)
+                    .set_core_ratio_ceiling(wanted)
+                    .map_err(|ex| anyhow::anyhow!("E-core ratio ceiling could not be verified: {ex}"))?;
+            }
+            Ok(())
+        })();
+        if let Err(ex) = r {
+            let mut restored = true;
+            for &(t, before) in &written {
+                restored &= self.drv.write_msr(Self::MSR_ATOM_TURBO_RATIO_LIMIT, before, t)
+                    && self.drv.read_msr(Self::MSR_ATOM_TURBO_RATIO_LIMIT, t).is_some_and(|a| a == before);
+            }
+            for (t, c) in &ceilings_before {
+                if let Some(c) = c.filter(|&c| c > 0) {
+                    restored &= OcMailbox::new(self.drv.clone(), *t).set_core_ratio_ceiling(c).is_ok();
+                }
+            }
+            bail!(
+                "{ex}{}",
+                if restored { " Previous E-core table restored." } else { " E-core table restore could not be verified." }
+            );
+        }
+        Ok(())
     }
 
     /// The all-core P ratio: the lowest entry of the turbo table (largest active-core group).
@@ -455,6 +634,12 @@ impl IntelCpu {
     }
 
     pub fn read_e_core_all_core_ratio(&self) -> Result<i32> {
+        if self.e_core_count == 0 {
+            // E-cores disabled in the BIOS: MSR 0x650 still holds the E-core table and reads
+            // from a P-core (x40 on the Z790 MPOWER), which is what MSI Dragon Power shows.
+            let r = self.read_or_throw(Self::MSR_ATOM_TURBO_RATIO_LIMIT, self.first_p_thread)?;
+            return Ok((0..8).map(|i| ((r >> (8 * i)) & 0xFF) as i32).filter(|&x| x > 0).min().unwrap_or(0));
+        }
         let (ratios, _) = self.read_e_core_turbo_table()?;
         Ok(ratios.into_iter().filter(|&r| r > 0).min().unwrap_or(0))
     }
@@ -466,6 +651,21 @@ impl IntelCpu {
     pub fn write_e_core_all_core_ratio(&self, ratio: i32) -> Result<()> {
         if !(8..=120).contains(&ratio) {
             bail!("Specified argument was out of the range of valid values. (Parameter 'ratio')");
+        }
+        if self.e_core_count == 0 {
+            // Same table through a P-core, populated groups only. Kept for when the E-cores are
+            // enabled again; with them disabled it changes no running clock.
+            let current = self.read_or_throw(Self::MSR_ATOM_TURBO_RATIO_LIMIT, self.first_p_thread)?;
+            if current == 0 {
+                bail!("No usable eight-entry E-core table.");
+            }
+            let mut v = 0u64;
+            for i in 0..8 {
+                if (current >> (8 * i)) & 0xFF != 0 {
+                    v |= (ratio as u64) << (8 * i);
+                }
+            }
+            return self.write_verified(Self::MSR_ATOM_TURBO_RATIO_LIMIT, v, self.first_p_thread);
         }
         let (current, _) = self.read_e_core_turbo_table()?;
         let table: Vec<i32> = current.iter().map(|&r| if r == 0 { 0 } else { ratio }).collect();

@@ -740,14 +740,17 @@ impl HardwareModel {
             if let Some(c) = cpu.clone() {
                 let r = c.clone();
                 s.read = Arc::new(move || Ok(Some(r.read_p_core_all_core_ratio()? as f64)));
-                s.write = Some(Arc::new(move |v| c.write_p_core_all_core_ratio(v.round() as i32)));
+                s.write = Some(Arc::new(move |v| c.write_p_core_all_core_ratio(v.round_ties_even() as i32)));
             }
             s.note = Some("All-core P-core multiplier (MSR 0x1AD turbo ratio table). Use Per Core Ratio for the per-active-core-count table.".into());
             s.available = cpu.is_some();
             rows.push(s);
         }
         {
-            let has_e = cpu.as_ref().is_some_and(|c| c.e_core_count() > 0);
+            // Not only when E-cores are enabled: with them disabled in the BIOS the table still
+            // reads (Dragon Power shows it), and setting it takes effect once they are enabled.
+            let e_disabled = cpu.as_ref().is_some_and(|c| c.e_core_count() == 0);
+            let has_e = cpu.as_ref().is_some_and(|c| c.e_core_count() > 0 || c.read_e_core_all_core_ratio().is_ok_and(|r| r > 0));
             let mut s = Setting::new("ecore_ratio", "E-Core Ratio", SettingGroup::Clocks);
             s.min = 8.0;
             s.max = 120.0;
@@ -756,9 +759,13 @@ impl HardwareModel {
             if let (Some(c), true) = (cpu.clone(), has_e) {
                 let r = c.clone();
                 s.read = Arc::new(move || Ok(Some(r.read_e_core_all_core_ratio()? as f64)));
-                s.write = Some(Arc::new(move |v| c.write_e_core_all_core_ratio(v.round() as i32)));
+                s.write = Some(Arc::new(move |v| c.write_e_core_all_core_ratio(v.round_ties_even() as i32)));
             }
-            s.note = Some("All-core E-core multiplier (MSR 0x650).".into());
+            s.note = Some(if e_disabled {
+                "All-core E-core multiplier (MSR 0x650). The E-cores are disabled in the BIOS: the value is stored but changes nothing until they are enabled.".into()
+            } else {
+                "All-core E-core multiplier (MSR 0x650).".into()
+            });
             s.available = has_e;
             rows.push(s);
         }
@@ -771,7 +778,7 @@ impl HardwareModel {
             if let Some(c) = cpu.clone() {
                 let r = c.clone();
                 s.read = Arc::new(move || Ok(Some(r.read_ring_ratio()?.0 as f64)));
-                s.write = Some(Arc::new(move |v| c.write_ring_ratio(v.round() as i32, None)));
+                s.write = Some(Arc::new(move |v| c.write_ring_ratio(v.round_ties_even() as i32, None)));
             }
             s.note = Some("Maximum ring/uncore multiplier. Verifies MSR 0x620 and updates the additional mailbox ceiling when one is reported. The running ring clock can be lower than this limit.".into());
             s.available = cpu.is_some();
@@ -819,14 +826,24 @@ impl HardwareModel {
                     _ => wc.mailbox().set_override(domain, v),
                 }));
                 let (dc, dcv) = (c.clone(), core_voltage.clone());
+                // Rows are built once, at start-up, so this is what the BIOS left. Restoring a
+                // domain the BIOS had in override mode to Auto instead (the .NET behaviour) drops
+                // e.g. a fixed 1.189 V SA to adaptive voltage - which hard-froze the Z790 MPOWER
+                // with overclocked DDR5. Put back the start-up override; Auto only if it was Auto.
+                let startup_override = c.mailbox().read_domain(domain).ok().filter(|d| d.override_mode).map(|d| d.target_volts);
                 s.restore_default = Some(Arc::new(move || match (&dcv, domain == OcMailbox::DOMAIN_CORE) {
                     (Some(reg), true) => clear_msi_core_override(reg, dc.mailbox()),
-                    _ => dc.mailbox().set_override(domain, 0.0),
+                    _ => dc.mailbox().set_override(domain, startup_override.unwrap_or(0.0)),
                 }));
             }
             s.note = Some(restriction.clone().unwrap_or_else(|| {
                 if domain == OcMailbox::DOMAIN_CORE && core_voltage.is_some() {
                     "CPU-core override written to both the MSI board regulator and Intel OC mailbox, in the same order as MSI Dragon Power. Both targets are read back; a failure rolls the regulator back. Enter 0 to return to adaptive mode.".into()
+                } else if domain == OcMailbox::DOMAIN_ECORE {
+                    // MSI Dragon Power 1.0.0.25 reads this same domain (mailbox 0x80000510) and,
+                    // when the target field is 0, displays a hard-coded 1.050 V (0x19A28 in its
+                    // 1/100 mV units). That number is not read from the CPU, so it is not shown here.
+                    "Programmed E-core L2 target through Intel OC mailbox domain 5. Auto means the CPU holds no target (MSI Dragon Power shows a built-in 1.050 V default in that case). Entering a value selects override mode; enter 0 to return to adaptive mode.".into()
                 } else if domain == OcMailbox::DOMAIN_RING {
                     "Programmed ring override through Intel OC mailbox domain 2. Auto means no explicit target. Live VID is shown separately and is not measured Vcore.".into()
                 } else {
@@ -842,13 +859,13 @@ impl HardwareModel {
             o.decimals = 0;
             if let (Some(c), true) = (cpu.clone(), mb_ok && available) {
                 let rc = c.clone();
-                o.read = Arc::new(move || Ok(Some((rc.mailbox().read_domain(domain)?.offset_volts * 1000.0).round())));
+                o.read = Arc::new(move || Ok(Some((rc.mailbox().read_domain(domain)?.offset_volts * 1000.0).round_ties_even())));
                 o.write = Some(Arc::new(move |v| c.mailbox().set_offset(domain, v / 1000.0)));
             }
             o.note = Some(
                 restriction
                     .clone()
-                    .unwrap_or_else(|| format!("Adaptive offset for FIVR domain {domain} (mailbox 0x150). Negative values undervolt.")),
+                    .unwrap_or_else(|| format!("Adaptive offset for FIVR domain {domain} (mailbox 0x150). Negative values undervolt. Refused while the domain is in override mode; change the voltage target instead.")),
             );
             o.available = mb_ok && available;
             [s, o]
@@ -887,7 +904,7 @@ impl HardwareModel {
                 if state.mode != 0 {
                     bail!("ASUS core voltage is in Manual mode; restore CPU Core to Auto before changing its adaptive offset.");
                 }
-                let idx = (v + 999.0).round();
+                let idx = (v + 999.0).round_ties_even();
                 if !(0.0..=u32::MAX as f64).contains(&idx) {
                     bail!("Arithmetic operation resulted in an overflow.");
                 }
@@ -935,6 +952,13 @@ impl HardwareModel {
             add_asus_rail("ecore", "CPU E-Core L2", AsusBoardControl::L2_ID, asus.baseline_l2());
             add_asus_rail("ring", "Ring", AsusBoardControl::RING_ID, asus.baseline_ring());
         }
+
+        // On LGA1700 the ring has no rail of its own: it runs from the P-core Vcore rail, which is
+        // why MSI Dragon Power offers no ring voltage at all. A mailbox ring target or offset only
+        // adds a request the shared VR may or may not honour. Keep the ASUS Cache SVID row (a real
+        // board control, built above in place of ring_v); drop the mailbox ring rows.
+        let asus_ring = rows.iter().any(|s| s.id == "ring_v" && s.name.ends_with("target"));
+        rows.retain(|s| s.id != "ring_off" && (s.id != "ring_v" || asus_ring));
 
         // ---------------- power limits ----------------
         if let Some(c) = &cpu {
@@ -1046,7 +1070,7 @@ impl HardwareModel {
             s.read = Arc::new(move || Ok(if live { a.smu().read_boost_limit_mhz().map(|v| v as f64) } else { None }));
             if live && msgs.rsmu_set_boost_limit_all != 0 {
                 let a = amd.clone();
-                s.write = Some(Arc::new(move |v| a.smu().set_boost_limit_mhz(v.round() as i32)));
+                s.write = Some(Arc::new(move |v| a.smu().set_boost_limit_mhz(v.round_ties_even() as i32)));
             }
             s.note = Some("Ceiling for the all-core boost clock (the SMU's boost limit, what the BIOS calls Max CPU Boost Clock Override / FMax). Raising it only helps if the CPU has thermal, current and power headroom left. 0 restores the start-up value.".into());
             s.available = live && msgs.has_boost_limit();
@@ -1093,7 +1117,7 @@ impl HardwareModel {
                 }
                 if ctx.table_fresh() {
                     if let Some(f) = limit(&a).filter(|f| *f > 0.0) {
-                        return Ok(Some((f as f64).round()));
+                        return Ok(Some((f as f64).round_ties_even()));
                     }
                 }
                 Ok(lock(&ctx.last_written).get(id).copied())
@@ -1255,7 +1279,7 @@ impl HardwareModel {
             if live && msgs.has_curve_optimizer() {
                 let (a, ctx) = (amd.clone(), self.ctx.clone());
                 s.write = Some(Arc::new(move |v| {
-                    let m = v.round() as i32;
+                    let m = v.round_ties_even() as i32;
                     a.smu().set_curve_optimizer_all(m)?;
                     lock(&ctx.last_written).insert("co_all".into(), m as f64);
                     let mut co = lock(&ctx.last_co);
@@ -1313,38 +1337,11 @@ impl HardwareModel {
 
     // ------------------------------------------------------------------ shared rows
     fn build_board_rails(&self, rows: &mut Vec<Setting>) {
-        // These have no CPU-side register at all: the motherboard's regulators produce them, and
-        // the only way to set them is that board's own VRM protocol. Shown live, read-only, rather
-        // than offered as a field that would silently do nothing.
+        // Board rails come from the motherboard's regulators, not a CPU register. Only CPU VDD2 is
+        // shown: it is settable on MSI EC boards. The read-only CPU AUX row was removed on request
+        // (it could not be set, and its reading is still in the start-up Log line "Board rails").
         let Some(sio) = self.super_io() else { return };
         self.add_vdd2_row(rows, &sio);
-        let mut add_board_rail = |id: &str, name: &str, rail: i32, note: &str| {
-            if !sio.named_rails().iter().any(|r| r.1 == rail) {
-                return;
-            }
-            match sio.read_voltage(rail) {
-                Some(v) if v >= 0.05 => {}
-                _ => return,
-            }
-            let mut s = Setting::new(id, name, SettingGroup::Board);
-            s.unit = "V".into();
-            s.min = 0.0;
-            s.max = 5.0;
-            s.decimals = 3;
-            let r = sio.clone();
-            s.read = Arc::new(move || Ok(r.read_voltage(rail)));
-            s.note = Some(note.into());
-            s.available = true;
-            rows.push(s);
-        };
-        add_board_rail(
-            "cpu_aux",
-            "CPU AUX Voltage",
-            SuperIo::RAIL_AUX,
-            "CPU AUX rail, measured at the board. It is produced by the motherboard VRM, like CPU VDD2, and most likely \
-             sits on the same EC I2C bus - but which device and register carry it has not been established, and this \
-             does not write a regulator it has not verified. Set it in the BIOS.",
-        );
     }
 
     /// CPU VDD2. Measured at the Super I/O either way; settable as well where the regulator on the
@@ -1697,6 +1694,9 @@ impl HardwareModel {
             {
                 self.emit(&format!("{}: register readback verified; actual rail voltage is unverified on this board.", s.name));
             }
+            if s.id == "cpu_ratio" {
+                self.check_effective_p_ratio(s, value.round() as i32);
+            }
             Ok(true)
         })();
         match r {
@@ -1706,6 +1706,57 @@ impl HardwareModel {
                 fail(s, format!("{e:#}"))
             }
         }
+    }
+
+    /// MSR 0x1AD reading back the new ratio does not prove the cores run at it: firmware can hold
+    /// the running ratio below the table (seen on the MSI Z790 MPOWER, which kept x54 with the
+    /// table, the mailbox ceiling and the OS request all at x55 and no limit reason set). Load the
+    /// P-cores briefly, read the ratio they actually run at, and say so when it falls short.
+    fn check_effective_p_ratio(&self, s: &mut Setting, requested: i32) {
+        let Some(cpu) = self.cpu() else { return };
+        let observed = {
+            let stop = Arc::new(AtomicBool::new(false));
+            // One busy thread: the highest bin is granted with few cores active, which is what
+            // HWiNFO's maximum and the vendor tool's frequency readout show. An all-core load can
+            // legitimately sit a bin lower and would report a working setting as capped.
+            let threads: Vec<_> = (0..1)
+                .map(|_| {
+                    let stop = stop.clone();
+                    std::thread::spawn(move || {
+                        let mut x = 1.0001f64;
+                        while !stop.load(Ordering::Relaxed) {
+                            x = (x * 1.000001 + 1e-9).sqrt();
+                        }
+                        std::hint::black_box(x);
+                    })
+                })
+                .collect();
+            native::sleep_ms(250);
+            let mut best = 0;
+            for _ in 0..6 {
+                best = best.max(cpu.read_max_current_p_ratio());
+                native::sleep_ms(50);
+            }
+            stop.store(true, Ordering::Relaxed);
+            for t in threads {
+                let _ = t.join();
+            }
+            best
+        };
+        if observed <= 0 {
+            return;
+        }
+        if observed >= requested {
+            self.emit(&format!("{}: P-cores now reach x{observed} with one core loaded.", s.name));
+            return;
+        }
+        s.last_result = Some(format!("set; CPU runs x{observed}"));
+        self.emit(&format!(
+            "{}: the turbo table and OC mailbox ceiling read back x{requested}, but the P-cores still reach only x{observed} with one core loaded. \
+             The firmware is capping the running ratio below the table; this usually means the BIOS fixed the CPU ratio at boot. \
+             Set the CPU ratio in the BIOS (or set it to Auto / dynamic there) to raise it.",
+            s.name
+        ));
     }
 
     /// The CPU accepting a voltage request does not prove the board acted on it. Compare the VID
@@ -1789,10 +1840,10 @@ impl HardwareModel {
                 st.package_watts = self.power_from_energy(j);
             }
         } else if let Some(amd) = self.amd() {
-            st.package_temp_c = amd.read_temperature().map(|t| t.round() as i32);
+            st.package_temp_c = amd.read_temperature().map(|t| t.round_ties_even() as i32);
             let mhz = amd.read_max_core_mhz() * (st.bclk_mhz.unwrap_or(100.0) / 100.0);
             st.core_mhz = Some(mhz);
-            st.core_ratio = Some((mhz / 100.0).round() as i32);
+            st.core_ratio = Some((mhz / 100.0).round_ties_even() as i32);
             st.core_vid = amd.read_core_vid();
             if let Ok(j) = amd.read_package_energy_joules() {
                 st.package_watts = self.power_from_energy(j);

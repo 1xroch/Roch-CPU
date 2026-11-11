@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 
-use super::model::{AmdInfo, CoreInfo, HeaderInfo, IntelInfo, LiveReadings, LogSink, TurboTable, UiModel};
+use super::model::{AmdInfo, CoreInfo, HeaderInfo, IntelInfo, LiveReadings, LogSink, UiModel};
 use crate::hw::pawnio::PawnIo;
 use crate::model::hardware_model::HardwareModel;
 use crate::model::memory_voltage_link::MemoryVoltageGrid;
@@ -169,9 +169,14 @@ impl UiModel for HardwareModel {
         let mut grids = HashMap::new();
         for dimm in self.dimms() {
             let id = dimm.slot_name().to_lowercase();
-            let grid = |base: i32, step: i32| MemoryVoltageGrid { base_millivolts: base, step_millivolts: step };
+            let grid = |base: i32, step: i32| MemoryVoltageGrid { base_millivolts: base, step_millivolts: step, max_code: 127 };
             grids.insert(format!("{id}_vdd"), grid(800, dimm.vdd_step_mv() as i32));
-            grids.insert(format!("{id}_vddq"), grid(800, dimm.vddq_step_mv() as i32));
+            let mut vddq = grid(800, dimm.vddq_step_mv() as i32);
+            if dimm.has_vddq_extension() && vddq.step_millivolts > 0 {
+                // SWC tops out at code 127 (1.435 V); the extension continues in the same 5 mV steps.
+                vddq.max_code = ((dimm.vddq_ceiling_v() * 1000.0).round() as i32 - 800) / vddq.step_millivolts;
+            }
+            grids.insert(format!("{id}_vddq"), vddq);
             grids.insert(format!("{id}_vpp"), grid(1500, if dimm.vpp_verified() { 5 } else { 0 }));
         }
         grids
@@ -204,25 +209,42 @@ impl UiModel for HardwareModel {
         HardwareModel::apply_curve_optimizer(self, &c, margin)
     }
 
-    fn read_p_core_turbo_table(&self) -> Result<TurboTable> {
-        let Some(cpu) = self.cpu() else { bail!("The per-core ratio table needs an Intel CPU.") };
-        let (ratios, cores) = cpu.read_p_core_turbo_table()?;
-        Ok(TurboTable { ratios: ratios.to_vec(), cores: cores.to_vec() })
+    fn read_p_core_ratio_ceilings(&self) -> Result<Vec<i32>> {
+        let Some(cpu) = self.cpu() else { bail!("Per-core ratios need an Intel CPU.") };
+        let all = cpu.read_p_core_ratio_ceilings();
+        if all.iter().any(|r| r.is_none_or(|v| v <= 0)) {
+            bail!("This CPU does not report a ratio limit per core.");
+        }
+        Ok(all.into_iter().flatten().collect())
     }
 
-    fn read_e_core_turbo_table(&self) -> Result<TurboTable> {
-        let Some(cpu) = self.cpu() else { bail!("The per-core ratio table needs an Intel CPU.") };
-        let (ratios, cores) = cpu.read_e_core_turbo_table()?;
-        Ok(TurboTable { ratios: ratios.to_vec(), cores: cores.to_vec() })
+    fn write_p_core_ratio_ceilings(&self, ratios: &[i32]) -> Result<()> {
+        let Some(cpu) = self.cpu() else { bail!("Per-core ratios need an Intel CPU.") };
+        cpu.write_p_core_ratio_ceilings(ratios)
     }
 
-    fn write_p_core_turbo_table(&self, ratios: &[i32]) -> Result<()> {
-        let Some(cpu) = self.cpu() else { bail!("The per-core ratio table needs an Intel CPU.") };
-        cpu.write_p_core_turbo_table(ratios)
+    fn read_e_cluster_ratios(&self) -> Result<Vec<(String, i32)>> {
+        let Some(cpu) = self.cpu() else { bail!("Per-core ratios need an Intel CPU.") };
+        let clusters = cpu.e_core_clusters(); // cached after the first call
+        let ratios = cpu.read_e_cluster_ratio_ceilings();
+        if ratios.iter().any(|r| r.is_none_or(|v| v <= 0)) {
+            bail!("This CPU does not report an E-core ratio limit per cluster.");
+        }
+        // Number E-cores after the P-cores, as HWiNFO does (P-core 0-5, E-core 6-13).
+        let mut next = cpu.p_core_count();
+        Ok(clusters
+            .iter()
+            .zip(ratios)
+            .map(|(cl, r)| {
+                let (first, last) = (next, next + cl.len() as i32 - 1);
+                next += cl.len() as i32;
+                (if first == last { format!("E-core {first}") } else { format!("E-cores {first}-{last}") }, r.unwrap_or(0))
+            })
+            .collect())
     }
 
-    fn write_e_core_turbo_table(&self, ratios: &[i32]) -> Result<()> {
-        let Some(cpu) = self.cpu() else { bail!("The per-core ratio table needs an Intel CPU.") };
-        cpu.write_e_core_turbo_table(ratios)
+    fn write_e_cluster_ratios(&self, ratios: &[i32]) -> Result<()> {
+        let Some(cpu) = self.cpu() else { bail!("Per-core ratios need an Intel CPU.") };
+        cpu.write_e_cluster_ratio_ceilings(ratios)
     }
 }

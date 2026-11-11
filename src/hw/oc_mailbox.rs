@@ -50,6 +50,13 @@ impl OcMailbox {
     pub const CMD_WRITE_VF: u8 = 0x11;
     pub const CMD_READ_ICCMAX: u8 = 0x16;
     pub const CMD_WRITE_ICCMAX: u8 = 0x17;
+    /// Turbo control word; MSI Dragon Power ORs 0x14 into it on every CPU-ratio apply.
+    pub const CMD_READ_MISC_TURBO: u8 = 0x18;
+    pub const CMD_WRITE_MISC_TURBO: u8 = 0x19;
+    /// Core ratio ceiling (low byte). Separate from MSR 0x1AD and the domain-0 VF ratio: on the
+    /// Z790 MPOWER it read x54 and held the cores there with both of those at x55.
+    pub const CMD_READ_CORE_RATIO_CEILING: u8 = 0x1C;
+    pub const CMD_WRITE_CORE_RATIO_CEILING: u8 = 0x1D;
 
     // Domain indices. Read off the hardware rather than taken from the usual documentation, by
     // comparing every domain against the values the vendor tool displays on a Raptor Lake-S /
@@ -112,10 +119,7 @@ impl OcMailbox {
             if (v >> 63) == 0 {
                 return true;
             }
-            // Thread.SpinWait(200)
-            for _ in 0..200 {
-                std::hint::spin_loop();
-            }
+            crate::hw::native::spin_wait(200); // Thread.SpinWait(200)
         }
         false
     }
@@ -208,11 +212,29 @@ impl OcMailbox {
     }
 
     /// Sets an adaptive-mode voltage offset, keeping the domain ratio.
+    ///
+    /// A domain in override mode keeps its override: the .NET build (and the first Rust port)
+    /// cleared override mode and the target here, so "SA offset -5 mV" on a BIOS that fixes SA at
+    /// 1.189 V silently switched SA to adaptive voltage instead - and the restore to 0 left it
+    /// adaptive. On the Z790 MPOWER with overclocked DDR5 that hard-froze the machine three times.
+    /// So in override mode a nonzero offset is refused (change the target instead), and 0 only
+    /// clears an offset while leaving the override target alone.
     pub fn set_offset(&self, domain: i32, offset_volts: f64) -> Result<()> {
         let _g = lock(&self.lock);
         let mut s = self.read_domain_locked(domain)?;
-        s.override_mode = false;
-        s.target_volts = 0.0;
+        if s.override_mode {
+            if offset_volts != 0.0 {
+                bail!(
+                    "Domain {domain} is in override mode ({:.3} V); an offset would switch it to adaptive voltage. Change the voltage target instead, or set the target to 0 (Auto) first.",
+                    s.target_volts
+                );
+            }
+            if s.offset_volts == 0.0 {
+                return Ok(());
+            }
+        } else {
+            s.target_volts = 0.0;
+        }
         s.offset_volts = offset_volts;
         self.write_domain_locked(domain, &s)
     }
@@ -229,6 +251,56 @@ impl OcMailbox {
             s.target_volts = volts;
         }
         self.write_domain_locked(domain, &s)
+    }
+
+    /// Current core ratio ceiling (mailbox 0x1C, low byte); `None` where the command is unsupported.
+    pub fn read_core_ratio_ceiling(&self) -> Option<i32> {
+        match self.execute(Self::CMD_READ_CORE_RATIO_CEILING, 0, 0, 0) {
+            Ok((0, d)) => Some((d & 0xFF) as i32),
+            _ => None,
+        }
+    }
+
+    /// Sets the core ratio ceiling to `wanted`, the way MSI Dragon Power applies a CPU ratio:
+    /// mailbox 0x1D with the ratio, then 0x14 ORed into the turbo control word (0x18 -> 0x19).
+    /// Without this the cores stay at the ceiling the BIOS left, whatever MSR 0x1AD says. Returns
+    /// whether anything was written. Firmware that does not implement 0x1C is left alone.
+    pub fn set_core_ratio_ceiling(&self, wanted: i32) -> Result<bool> {
+        // A ceiling of 0 means none is reported (or the command is a stub): leave it alone, as
+        // the domain-0 ratio is when the mailbox reports 0.
+        let Some(current) = self.read_core_ratio_ceiling().filter(|&c| c > 0) else { return Ok(false) };
+        if current == wanted || !(1..=255).contains(&wanted) {
+            return Ok(false);
+        }
+        let (st, _) = self.execute(Self::CMD_WRITE_CORE_RATIO_CEILING, 0, 0, wanted as u32)?;
+        if st != 0 {
+            bail!("Core ratio ceiling x{wanted} rejected: {}.", Self::describe_status(st));
+        }
+        if let Ok((0, misc)) = self.execute(Self::CMD_READ_MISC_TURBO, 0, 0, 0) {
+            if misc & 0x14 != 0x14 {
+                let (st, _) = self.execute(Self::CMD_WRITE_MISC_TURBO, 0, 0, misc | 0x14)?;
+                if st != 0 {
+                    bail!("Turbo control update rejected: {}.", Self::describe_status(st));
+                }
+            }
+        }
+        // The new ceiling shows up a little after the write is acknowledged (50 -> 55 still read
+        // x50 straight away and x55 seconds later), so give the read-back up to ~0.5 s.
+        let mut last = None;
+        for _ in 0..25 {
+            last = self.read_core_ratio_ceiling();
+            if last == Some(wanted) {
+                return Ok(true);
+            }
+            crate::hw::native::sleep_ms(20);
+        }
+        match last {
+            Some(r) if r == wanted => Ok(true),
+            other => bail!(
+                "Core ratio ceiling did not read back x{wanted} (read {}).",
+                other.map_or("nothing".to_string(), |r| format!("x{r}"))
+            ),
+        }
     }
 
     /// IccMax for a domain in amperes (mailbox 0x16, 1/4 A units).
@@ -275,6 +347,19 @@ mod tests {
         let mb = OcMailbox::new(FakeDriver::new(), 0);
         mb.set_offset(0, -0.05).unwrap();
         assert!((mb.read_domain(0).unwrap().offset_volts + 0.05).abs() < 1.0 / 1024.0, "Offset sign/precision");
+    }
+
+    #[test]
+    fn offset_never_drops_an_override() {
+        let d = FakeDriver::new();
+        let mb = OcMailbox::new(d.clone(), 4);
+        mb.set_override(4, 1.189).unwrap();
+        let before = mb.read_domain(4).unwrap();
+        assert!(mb.set_offset(4, -0.005).is_err(), "nonzero offset in override mode must be refused");
+        assert_eq!(mb.read_domain(4).unwrap(), before, "refused offset changed the domain");
+        mb.set_offset(4, 0.0).unwrap();
+        let after = mb.read_domain(4).unwrap();
+        assert!(after.override_mode && (after.target_volts - 1.189).abs() < 1.0 / 1024.0, "restoring 0 dropped the override");
     }
 
     #[test]

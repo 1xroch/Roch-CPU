@@ -12,17 +12,28 @@ A Windows CPU and DDR5 memory tuning tool for supported Intel LGA1700 and AMD Ry
 
 Windows 10/11 x64 is required. If Windows blocks a driver, some controls will be unavailable.
 
+## What's new in 1.0.7
+
+- **Per-core ratios, the MSI Dragon Power way:** the Per-Core Ratio window now sets each physical P-core's own ratio, and each E-core cluster's (E-cores share one clock per cluster of four). A core runs no faster than its value. The old "by active cores" turbo-table editor is gone; the all-core limits stay on the CPU Ratio and E-Core Ratio rows.
+- **Ratio changes reach every core:** CPU and E-core ratios now also set the CPU's per-core ratio ceiling (OC mailbox `0x1C`/`0x1D`) on every core and cluster, as Dragon Power does. Before, only the first core's ceiling changed, so raised ratios could be capped and the second E-core cluster kept its old ratio. The E-core ratio works with E-cores enabled or disabled.
+- **DDR5 VDDQ above 1.435 V:** on PMIC ID `8A12` kits, VDDQ uses the same register extension Dragon Power uses, so it goes past the 5 mV setpoint's 1.435 V top. DIMM VDD and VDDQ limits now match Dragon Power (0.800-2.500 V; the PMIC register's own maximum still applies).
+- **Fixed: a voltage offset could switch an override to Auto.** On a BIOS that fixes SA (or Core) in override mode, entering an offset silently switched that rail to adaptive voltage, which hard-froze the test system with overclocked DDR5. Offsets are now refused while a rail is in override mode, and restoring a voltage puts back the BIOS's own override instead of Auto.
+- **Fixed: a VDD write could raise VDDQ.** VDD was copied into PMIC register `0x23` whenever it was non-zero; on `8A12` kits that register is the VDDQ extension. It is now only mirrored when it really is a second VDD phase.
+- **Safer hardware timing:** embedded-controller and SMBus polling waits at least 8 ms per poll again, as the .NET build did (the Rust port had been polling about seven times faster). Failed ratio changes now roll back the table, the core ratio and every per-core limit.
+- **Interface:** header values in red; the live readout line, the Ring Voltage rows (the ring runs on the Vcore rail, so Dragon Power has none) and the read-only CPU AUX row are gone; no confirmation prompts on voltages; the window fits the monitor's work area; Apply in the per-core window runs in the background.
+- **Diagnostics:** `--apply` takes several `row value` pairs in one run; `--probe` lists every core's ratio limit and the E-core clusters; `--vr-page1` reads the MSI core regulator's second output.
+
 ## Features
 
-- **Intel tuning:** supported core, E-core and ring ratios, voltage offsets/overrides, and PL1/PL2 power limits. BIOS locks and CPU/chipset restrictions still apply.
+- **Intel tuning:** P-core, E-core and ring ratios, per-core and per-E-core-cluster ratios, voltage offsets/overrides, and PL1/PL2 power limits. BIOS locks and CPU/chipset restrictions still apply; a ratio the BIOS caps (for example x54 on the tested Z790MPOWER) cannot be raised from Windows.
 - **AMD Ryzen tuning:** PPT, TDC, EDC, thermal limit, PBO scalar and supported FMax controls through the SMU. With PawnIO installed, each limit row also shows the live draw (watts, amps, temperature); without it the app says so and links to pawnio.eu.
 - **Per-core Curve Optimizer:** edit individual AMD core offsets, refresh hardware readings and apply changes from a dedicated window.
-- **DDR5 memory voltages:** per-DIMM VDD, VDDQ and VPP controls where the PMIC permits writes, with calibration and read-back checks.
+- **DDR5 memory voltages:** per-DIMM VDD, VDDQ and VPP controls where the PMIC permits writes, with calibration and read-back checks against the PMIC's own ADC. Sync DIMMs sets matching rails together. VDD/VDDQ 0.800-2.500 V, VPP 1.500-2.135 V, within what each PMIC register can hold.
 - **Board-specific controls:** CPU Core override, base clock and CPU VDD2 on supported MSI Intel 600/700-series boards. Core override updates both the Renesas regulator and Intel OC mailbox, with read-back and rail verification. AMD BCLK writing is not enabled on the tested B850MPOWER.
 - **Light and dark modes:** light by default, switched with the sun/moon button beside minimize. Grouped clock, power, boost and memory sections in a compact window, allowed ranges in each row's tooltip, and a log explaining rejected or unavailable settings.
 - **Social links:** YouTube | X | Discord in the bottom-left footer, matching Roch Viewer.
-- **Hardware-read header:** CPU, core/thread topology, microcode, motherboard, AGESA (AMD) and BIOS values are labeled consistently above the controls. On AMD the Base Clock row shows the measured BCLK (read-only).
-- **Intel voltage read-back:** programmed Core, E-core L2, Ring, SA and GT targets are shown when firmware supplies them. On supported MSI boards, Core displays the regulator target rather than a potentially stale mailbox-only value; an adaptive Ring with no encoded target displays `Auto` (no explicit target), while VID and measured Vcore remain separate header readings.
+- **Hardware-read header:** CPU, core/thread topology, microcode, motherboard, AGESA (AMD) and BIOS values, with the values in red. On AMD the Base Clock row shows the measured BCLK (read-only).
+- **Intel voltage read-back:** programmed Core, E-core L2, SA and GT targets are shown when firmware supplies them. On supported MSI boards, Core displays the regulator target rather than a potentially stale mailbox-only value. `Auto` means the CPU holds no explicit target (MSI Dragon Power shows a built-in 1.050 V for E-core L2 in that case; it is not a reading).
 - **Apply and Reset:** Apply writes your edits; Reset restores the tool's startup baseline where supported.
 
 Controls vary by processor, motherboard, BIOS and driver access. Optional [PawnIO](https://pawnio.eu) enables AMD SMU power-table read-back for PPT/TDC/EDC; Roch CPU does not install it automatically. See the [hardware reference](docs/reference.md) for platform details.
@@ -34,7 +45,7 @@ Controls vary by processor, motherboard, BIOS and driver access. Optional [PawnI
   <img src="screenshot-amd.png" alt="Roch CPU AMD Ryzen tuning controls" width="360">
 </p>
 
-Left: Roch CPU 1.0.3 on an Intel Core i5-14600KF / Z790MPOWER, including the board-backed Core override and numeric adaptive Ring voltage. Right: Roch CPU 1.0.5 on an AMD Ryzen 7 9850X3D / X870 AORUS TACHYON ICE in the default light theme, with the AGESA version, measured base clock and live PPT/TDC/EDC/temperature readings (PawnIO installed). Available rows follow the detected hardware. Displayed settings are examples, not tuning recommendations.
+Left: Roch CPU 1.0.7 on an Intel Core i5-14600KF (6P + 8E) / Z790MPOWER, with the board-backed Core override, CPU VDD2 and synced DDR5 targets. Right: Roch CPU 1.0.5 on an AMD Ryzen 7 9850X3D / X870 AORUS TACHYON ICE in the default light theme, with the AGESA version, measured base clock and live PPT/TDC/EDC/temperature readings (PawnIO installed). Available rows follow the detected hardware. Displayed settings are examples, not tuning recommendations.
 
 ## Build the latest source
 
@@ -45,7 +56,7 @@ Roch CPU is written in Rust. Install the stable **Rust toolchain** for `x86_64-p
 build.cmd
 ```
 
-Open `dist\Roch CPU.exe`. The current version is **1.0.6**. The executable has no runtime
+Open `dist\Roch CPU.exe`. The current version is **1.0.7**. The executable has no runtime
 dependency; keep the driver and `pawnio` folder that `build.cmd` copies beside it.
 
 ### Intel write verification
@@ -99,11 +110,15 @@ A completely empty domain no longer causes a verified ring-register write to be 
 back. This preserves the mailbox path used on MSI boards. `--ring-validate` briefly lowers
 the ring ceiling, checks the running ring ratio, and restores the original register. It
 requires one Roch CPU instance and writes `ring-validation.txt` beside the executable.
-The header displays live P-core, E-core and ring ratios separately from their limits.
+The running P-core, E-core and ring ratios are in HWiNFO or `--probe`; the window shows the limits.
 
 E-core control preserves unused zero entries in the turbo table. Boards exposing a
 single active entry update that entry; fully populated tables continue to update all
-groups. The per-core editor disables unused groups instead of programming them.
+groups. MSR `0x650` and the ratio ceiling are written on every E-core cluster.
+
+The Per-Core Ratio window sets each P-core's and each E-core cluster's own ratio ceiling
+(OC mailbox `0x1D`, run on that core). Clusters are found from the CPU's L2 cache
+topology, not assumed. A failed write puts every changed limit back.
 
 When Hyper-V is active, the app checks Windows event 12550 from the current boot.
 If Windows explicitly reports restricted writes to the voltage mailbox, voltage rows
@@ -133,6 +148,6 @@ cargo test --release
 
 Created by **Roch Studio / [@MateoPCTech](https://x.com/MateoPCTech)**. See [third-party notices](THIRD-PARTY-NOTICES.md) for attribution, component licenses and implementation details.
 
-[YouTube](https://www.youtube.com/@MateoPcTech) | [X](https://x.com/MateoPCTech) | [Discord](https://discord.gg/KfzExpKQHB)
+[YouTube](https://www.youtube.com/@MateoPcTech) | [X](https://x.com/1xroch) | [Discord](https://discord.gg/KfzExpKQHB)
 
 [Hardware details](docs/reference.md) · [BCLK investigation](docs/b850mpower-bclk-investigation.md) · [License](LICENSE)

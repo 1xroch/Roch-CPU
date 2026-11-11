@@ -78,8 +78,36 @@ pub fn app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// `Thread.SpinWait(iterations)`. .NET normalises each iteration to about 35 ns whatever the
+/// CPU's `pause` latency, so the busy-poll budgets ported from it (OC mailbox, SMBus) are time
+/// budgets; a raw `pause` loop is shorter or longer depending on the core. Spin for that time.
+pub fn spin_wait(iterations: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(iterations as u64 * 35);
+    while std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
+const MIN_SLEEP_MS: u64 = 8;
+
+/// `Thread.Sleep(ms)`: the plain Win32 `Sleep`, which rounds up to the system timer tick.
+///
+/// Not `std::thread::sleep`: Rust's uses a high-resolution waitable timer, so `sleep(1)` really
+/// is 1 ms, where the .NET build's `Thread.Sleep(1)` waited a whole tick (measured ~7.6 ms on the
+/// Z790 MPOWER). Every EC doorbell, EC page and SMBus poll loop here was written and validated
+/// against the .NET rate; at the high-resolution rate those loops hammer the embedded controller
+/// about seven times harder - exactly the kind of traffic that has hard-reset this board
+/// (Kernel-Power 41). The wall-clock timeouts around the loops are unchanged.
+///
+/// Plain `Sleep` still depends on the system timer: any program that raises the timer resolution
+/// (HWiNFO, browsers, games) turns `Sleep(1)` back into ~1 ms. So short waits get a fixed 8 ms
+/// floor, about the rate the .NET build polled at, whatever else is running. Longer waits are
+/// unchanged; every poll loop keeps its own wall-clock timeout.
 pub fn sleep_ms(ms: u64) {
-    std::thread::sleep(std::time::Duration::from_millis(ms));
+    use windows_sys::Win32::System::Threading::Sleep;
+    let ms = if (1..MIN_SLEEP_MS).contains(&ms) { MIN_SLEEP_MS } else { ms };
+    // SAFETY: Sleep has no preconditions.
+    unsafe { Sleep(ms.min(u32::MAX as u64 - 1) as u32) };
 }
 
 /// Pins the calling thread to one logical CPU for the duration of `action`.

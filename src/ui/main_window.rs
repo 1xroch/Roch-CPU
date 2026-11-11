@@ -13,7 +13,7 @@ use eframe::egui::{
 };
 
 use super::curve_optimizer::CurveOptimizerDialog;
-use super::log_window::{LogBuffer, LogWindow};
+use super::log_window::{self, LogBuffer, LogWindow};
 use super::model::UiModel;
 use super::per_core::PerCoreDialog;
 use super::preview::PreviewOptions;
@@ -119,6 +119,9 @@ pub struct MainWindow {
     status: (String, bool),
     applying: bool,
     controls_enabled: bool,
+    /// Shared DIMM text typed while an Apply runs: shown (as the .NET box kept it) but never
+    /// staged, and dropped when the Apply finishes.
+    typed_while_applying: HashMap<String, String>,
     apply_enabled: bool,
     reset_enabled: bool,
     per_core_enabled: bool,
@@ -134,6 +137,9 @@ pub struct MainWindow {
     curve: Option<CurveOptimizerDialog>,
     visuals_dark: Option<bool>,
     fit_pending: u8,
+    /// Theme, minimise and close buttons; kept out of the resize border, as WinForms' child
+    /// buttons were never part of the form's WM_NCHITTEST area.
+    caption_rect: Option<Rect>,
     scroll_pending: u8,
 }
 
@@ -187,6 +193,7 @@ impl MainWindow {
             status: (String::new(), false),
             applying: false,
             controls_enabled: true,
+            typed_while_applying: HashMap::new(),
             apply_enabled: false,
             reset_enabled: false,
             per_core_enabled: false,
@@ -200,6 +207,7 @@ impl MainWindow {
             curve: None,
             visuals_dark: Some(theme::is_dark()),
             fit_pending: 0,
+            caption_rect: None,
             scroll_pending: 0,
         }
     }
@@ -276,9 +284,19 @@ impl MainWindow {
             .unwrap_or_default();
         self.append_log(&format!("{APP_NAME} {APP_VERSION} starting from {dir}"));
         self.phase = Phase::Initializing;
-        let (model, tx, ctx) = (self.model.clone(), self.tx.clone(), self.ctx.clone());
+        let (model, tx, ctx, log) = (self.model.clone(), self.tx.clone(), self.ctx.clone(), self.log.clone());
         std::thread::spawn(move || {
-            model.initialize();
+            // A panic here must still finish start-up: without Initialized the window would stay
+            // blank with every control disabled and no explanation. Whatever was detected before
+            // the panic is shown, and the Log says what went wrong.
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.initialize())) {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown error".into());
+                log.append(&format!("Start-up failed: {msg}. Hardware detected before the failure is shown."));
+            }
             let _ = tx.send(Event::Initialized);
             ctx.request_repaint();
         });
@@ -445,6 +463,7 @@ impl MainWindow {
                 Event::HardwareDone { status, error } => {
                     self.set_status(status, error);
                     self.set_controls_enabled(true);
+                    self.typed_while_applying.clear();
                     self.applying = false;
                     self.last_tick = Some(Instant::now());
                 }
@@ -954,7 +973,19 @@ impl MainWindow {
 
     fn toggle_log(&mut self) {
         if self.log_window.open {
-            self.log_window.open = false;
+            // The .NET log was an owned window, always above the main one, so "Log" only ever
+            // hid it. This one is a separate top-level window: if it overlaps the main window,
+            // clicking here just raised the main window over it, so bring it forward instead.
+            let log_id = egui::ViewportId::from_hash_of(log_window::VIEWPORT);
+            let log_rect = self.ctx.input_for(log_id, |i| i.viewport().outer_rect);
+            let main_rect = self.ctx.input(|i| i.viewport().outer_rect);
+            if let (Some(l), Some(m)) = (log_rect, main_rect)
+                && l.intersects(m)
+            {
+                self.ctx.send_viewport_cmd_to(log_id, ViewportCommand::Focus);
+            } else {
+                self.log_window.open = false;
+            }
         } else {
             let outer = self.ctx.input(|i| i.viewport().outer_rect);
             self.log_window.position = outer.map(|r| pos2(r.max.x + 6.0, r.min.y));
@@ -1015,6 +1046,7 @@ impl MainWindow {
         let close_rect = Rect::from_min_size(pos2(rect.max.x - 44.0, rect.min.y), vec2(44.0, TITLE_HEIGHT));
         let min_rect = close_rect.translate(vec2(-44.0, 0.0));
         let theme_rect = Rect::from_min_size(pos2(min_rect.min.x - 36.0, rect.min.y), vec2(36.0, TITLE_HEIGHT));
+        self.caption_rect = Some(theme_rect.union(close_rect));
         if theme::title_button(ui, close_rect, Caption::Close).clicked() {
             ui.ctx().send_viewport_cmd(ViewportCommand::Close);
         }
@@ -1074,7 +1106,7 @@ impl MainWindow {
         }
 
         // Use natural content height within the work area; overflow stays in the settings viewport.
-        if self.fit_pending > 0 && self.phase == Phase::Ready && !self.rows.is_empty() {
+        if self.fit_pending > 0 && self.phase == Phase::Ready {
             self.fit_pending -= 1;
             if self.fit_pending == 0 {
                 self.fit_to_content(content_height, viewport_height);
@@ -1083,20 +1115,28 @@ impl MainWindow {
     }
 
     fn fit_to_content(&mut self, content_height: f32, viewport_height: f32) {
-        let (inner, outer, monitor) =
-            self.ctx.input(|i| (i.viewport().inner_rect, i.viewport().outer_rect, i.viewport().monitor_size));
+        let (inner, outer, monitor, ppp) = self.ctx.input(|i| {
+            (i.viewport().inner_rect, i.viewport().outer_rect, i.viewport().monitor_size, i.pixels_per_point())
+        });
         let Some(inner) = inner else { return };
         let needed = inner.height() - viewport_height + content_height + 2.0;
+        // `Screen.FromControl(this).WorkingArea`: the work area (taskbar excluded) of the monitor
+        // the window is on, in points. Falls back to the whole primary monitor if Win32 says no.
+        let work = outer
+            .and_then(|o| win::work_area_at((o.center().x * ppp) as i32, (o.center().y * ppp) as i32))
+            .map(|(l, t, r, b)| Rect::from_min_max(pos2(l as f32 / ppp, t as f32 / ppp), pos2(r as f32 / ppp, b as f32 / ppp)))
+            .or_else(|| monitor.map(|m| Rect::from_min_size(pos2(0.0, 0.0), m)));
         let mut height = needed;
-        if let Some(m) = monitor {
-            height = height.min(m.y - 40.0);
+        if let Some(w) = work {
+            height = height.min(w.height() - 40.0);
         }
         let height = height.max(400.0).round();
         self.ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(inner.width(), height)));
-        if let (Some(outer), Some(m)) = (outer, monitor) {
-            let bottom_limit = m.y - 40.0;
-            if outer.min.y + height > bottom_limit {
-                let top = (bottom_limit - height - 10.0).max(0.0);
+        if let (Some(outer), Some(w)) = (outer, work) {
+            // Outer height after the resize: the frame around the inner area stays the same.
+            let outer_height = height + (outer.height() - inner.height()).max(0.0);
+            if outer.min.y + outer_height > w.max.y {
+                let top = (w.max.y - outer_height - 10.0).max(w.min.y);
                 self.ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(outer.min.x, top)));
             }
         }
@@ -1108,8 +1148,10 @@ impl MainWindow {
         // Log button top right.
         let log_rect = Rect::from_min_size(pos2(top.x + width - 64.0, top.y + 2.0), vec2(64.0, 24.0));
         let cpu = self.header.cpu.clone();
-        let h = theme::text_height(ui, &cpu, theme::bold(), wrap);
-        theme::paint_text(ui, top, Align2::LEFT_TOP, &cpu, theme::bold(), theme::text(), Some(wrap));
+        // Header lines are `Label: value`; the values are drawn in the accent red.
+        let galley = theme::key_value_galley(ui, &cpu, theme::bold(), theme::text(), theme::accent(), wrap);
+        let h = galley.size().y;
+        ui.painter().galley(top, galley, theme::text());
         ui.allocate_exact_size(vec2(width - 70.0, h.max(14.0)), Sense::hover());
         if theme::button_at(ui, log_rect, "Log", false, true, theme::base()).clicked() {
             self.toggle_log();
@@ -1119,12 +1161,10 @@ impl MainWindow {
             lines.push(a.clone());
         }
         lines.push(self.header.bios.clone());
-        if let Some(l) = &self.header.live {
-            lines.push(l.clone());
-        }
+        // No live readout line: it was removed from the header on request.
         for line in lines {
             ui.add_space(1.0);
-            theme::wrapped_label(ui, &line, theme::base(), theme::text(), wrap, Margin::ZERO);
+            theme::key_value_label(ui, &line, theme::base(), theme::text(), theme::accent(), wrap);
         }
         if let Some(w) = self.header.warn.clone() {
             ui.add_space(4.0);
@@ -1290,8 +1330,14 @@ impl MainWindow {
         let box_rect = Rect::from_min_size(pos2(x + 180.0, rect.min.y + 1.0), vec2(76.0, 24.0));
         let box_id = Id::unique(("shared-box", rail));
         self.box_ids.insert(box_id);
-        let mut shown = projection.text.clone();
+        let mut shown = match self.typed_while_applying.get(rail) {
+            Some(t) if self.applying => t.clone(),
+            _ => projection.text.clone(),
+        };
         let response = theme::value_box(ui, box_rect, box_id, &mut shown, projection.enabled, self.is_preview(), projection.tone.color());
+        if self.applying && shown != projection.text {
+            self.typed_while_applying.insert(rail.into(), shown.clone());
+        }
         if shown != projection.text && !self.applying && response.has_focus() {
             self.shared_drafts.insert(rail.into(), shown);
             self.pending_shared.insert(rail.into());
@@ -1382,6 +1428,9 @@ impl MainWindow {
             return;
         }
         let Some(p) = pointer else { return };
+        if self.caption_rect.is_some_and(|c| c.contains(p)) {
+            return;
+        }
         let (l, r) = (p.x < rect.min.x + RESIZE_BORDER, p.x >= rect.max.x - RESIZE_BORDER);
         let (t, b) = (p.y < rect.min.y + RESIZE_BORDER, p.y >= rect.max.y - RESIZE_BORDER);
         let dir = match (t, b, l, r) {

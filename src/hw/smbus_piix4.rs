@@ -51,11 +51,9 @@ pub struct SmbusPiix4 {
     lock: Mutex<()>,
 }
 
-/// `Thread.SpinWait(n)`.
+/// `Thread.SpinWait(n)`; see `native::spin_wait`.
 fn spin_wait(iterations: u32) {
-    for _ in 0..iterations {
-        std::hint::spin_loop();
-    }
+    super::native::spin_wait(iterations);
 }
 
 impl SmbusPiix4 {

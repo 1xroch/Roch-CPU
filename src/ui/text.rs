@@ -5,14 +5,15 @@ use super::model::{AmdInfo, IntelInfo, LiveReadings};
 use crate::model::setting::{Setting, SettingGroup};
 
 pub const APP_NAME: &str = "Roch CPU";
-pub const APP_VERSION: &str = "1.0.6";
+/// From Cargo.toml, so the window, the file version resource and `--help` never disagree.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `BclkController.ConfirmAboveMHz`: no ceiling on base clock, but a figure above this is worth
 /// a second look. Hard-coded here so the window does not name the hardware module.
 pub const BCLK_CONFIRM_ABOVE_MHZ: f64 = 105.0;
 
 pub const YOUTUBE_URL: &str = "https://www.youtube.com/@MateoPcTech";
-pub const AUTHOR_URL: &str = "https://x.com/MateoPCTech";
+pub const AUTHOR_URL: &str = "https://x.com/1xroch";
 pub const DISCORD_URL: &str = "https://discord.gg/KfzExpKQHB";
 pub const PAWNIO_SITE: &str = "pawnio.eu";
 pub const PAWNIO_URL: &str = "https://pawnio.eu";
@@ -107,11 +108,12 @@ pub fn is_memory_target_edited(s: &Setting, text: &str) -> bool {
 /// Whether a value is above the usual daily-use range and needs a confirmation.
 pub fn is_risky(id: &str, value: f64) -> bool {
     match id {
-        "core_v" => value > 1.45,
-        "ecore_v" | "ring_v" | "sa_v" | "gt_v" => value > 1.35,
-        "core_off" | "ecore_off" | "ring_off" | "sa_off" | "gt_off" => value > 150.0,
-        _ if id.ends_with("_vdd") || id.ends_with("_vddq") => value > 1.40,
-        _ if id.ends_with("_vpp") => value > 1.95,
+        // No confirmation for any voltage (CPU core, E-core L2, ring, SA, GT, their offsets, or
+        // the DIMM rails): removed on request. Range checks, read-back and the rail/ADC
+        // verification still run on every write.
+        // DIMM VDD / VDDQ / VPP: no confirmation (removed on request). Overclocking kits run
+        // above JEDEC every day, so the prompt fired on every Apply; each PMIC write is still
+        // range-checked, read back and re-measured against the PMIC's ADC.
         "ppt" => value > 500.0,
         "tdc" | "edc" => value > 800.0,
         "co_all" => value > 15.0,
@@ -214,38 +216,6 @@ pub fn parse_int(text: &str) -> Option<i32> {
     let t = text.trim_matches(|c: char| c.is_whitespace());
     let t = t.strip_prefix('+').filter(|r| !r.starts_with(['+', '-'])).unwrap_or(t);
     t.parse::<i32>().ok()
-}
-
-// ---------------------------------------------------------------- per-core ratio table
-pub fn p_group_label(cores: i32) -> String {
-    format!("{cores} P-core{} active", if cores == 1 { "" } else { "s" })
-}
-
-pub fn e_group_label(index: usize, ratios: &[i32], cores: &[i32]) -> String {
-    if ratios[index] == 0 {
-        "Unused group".into()
-    } else if ratios.iter().filter(|r| **r > 0).count() == 1 {
-        "All E-cores".into()
-    } else if cores[index] > 0 {
-        format!("{} E-core{} active", cores[index], if cores[index] == 1 { "" } else { "s" })
-    } else {
-        format!("E-core group {}", index + 1)
-    }
-}
-
-/// Validates the turbo ratio boxes; returns (P ratios, E ratios) or the .NET error text.
-pub fn validate_turbo(p: &[String], e: &[(String, bool)], e_cores: i32) -> Result<(Vec<i32>, Vec<i32>), String> {
-    let pr: Vec<i32> = p.iter().map(|t| parse_int(t).unwrap_or(0)).collect();
-    let er: Vec<i32> = e.iter().map(|(t, _)| parse_int(t).unwrap_or(0)).collect();
-    if pr.iter().any(|v| *v < 8 || *v > 120) {
-        return Err("Every P-core group needs a ratio between 8 and 120.".into());
-    }
-    if e_cores > 0
-        && e.iter().filter(|(_, enabled)| *enabled).any(|(t, _)| parse_int(t).is_none_or(|v| !(8..=120).contains(&v)))
-    {
-        return Err("Every E-core group needs a ratio between 8 and 120.".into());
-    }
-    Ok((pr, er))
 }
 
 // ---------------------------------------------------------------- Curve Optimizer
@@ -357,11 +327,8 @@ mod tests {
 
     #[test]
     fn risky_thresholds() {
-        assert!(is_risky("core_v", 1.46) && !is_risky("core_v", 1.45));
-        assert!(is_risky("ring_v", 1.36) && !is_risky("ring_v", 1.35));
-        assert!(is_risky("sa_off", 151.0) && !is_risky("sa_off", 150.0));
-        assert!(is_risky("dimma1_vdd", 1.41) && is_risky("dimmb2_vddq", 1.41) && !is_risky("dimma1_vdd", 1.40));
-        assert!(is_risky("dimma1_vpp", 1.96) && !is_risky("dimma1_vpp", 1.95));
+        assert!(!is_risky("core_v", 1.60) && !is_risky("sa_v", 1.50) && !is_risky("sa_off", 300.0));
+        assert!(!is_risky("dimma1_vdd", 1.45) && !is_risky("dimmb2_vddq", 1.45) && !is_risky("dimma1_vpp", 2.0));
         assert!(is_risky("ppt", 501.0) && is_risky("edc", 801.0) && !is_risky("tdc", 800.0));
         assert!(is_risky("co_all", 16.0) && !is_risky("co_all", -30.0));
         assert!(is_risky("bclk", 105.01) && !is_risky("bclk", 105.0));
@@ -460,35 +427,6 @@ mod tests {
         assert_eq!(parse_int("1.5"), None);
         assert_eq!(parse_int("+-1"), None);
         assert_eq!(parse_int(""), None);
-    }
-
-    #[test]
-    fn turbo_labels() {
-        assert_eq!(p_group_label(1), "1 P-core active");
-        assert_eq!(p_group_label(6), "6 P-cores active");
-        let ratios = [44, 43, 0, 0, 0, 0, 0, 0];
-        let cores = [4, 8, 0, 0, 0, 0, 0, 0];
-        assert_eq!(e_group_label(0, &ratios, &cores), "4 E-cores active");
-        assert_eq!(e_group_label(2, &ratios, &cores), "Unused group");
-        assert_eq!(e_group_label(1, &ratios, &[4, 0, 0, 0, 0, 0, 0, 0]), "E-core group 2");
-        assert_eq!(e_group_label(0, &[44, 0, 0, 0, 0, 0, 0, 0], &cores), "All E-cores");
-        assert_eq!(e_group_label(0, &ratios, &[1, 8, 0, 0, 0, 0, 0, 0]), "1 E-core active");
-    }
-
-    #[test]
-    fn turbo_validation() {
-        let p: Vec<String> = ["56", "56", "55", "55", "54", "54", "54", "54"].iter().map(|s| s.to_string()).collect();
-        let e: Vec<(String, bool)> = (0..8).map(|i| if i < 2 { ("44".to_string(), true) } else { ("N/A".to_string(), false) }).collect();
-        let (pr, er) = validate_turbo(&p, &e, 8).unwrap();
-        assert_eq!(pr[0], 56);
-        assert_eq!(er, vec![44, 44, 0, 0, 0, 0, 0, 0]);
-        let mut bad = p.clone();
-        bad[3] = "7".into();
-        assert_eq!(validate_turbo(&bad, &e, 8).unwrap_err(), "Every P-core group needs a ratio between 8 and 120.");
-        let mut bad_e = e.clone();
-        bad_e[1].0 = "x".into();
-        assert_eq!(validate_turbo(&p, &bad_e, 8).unwrap_err(), "Every E-core group needs a ratio between 8 and 120.");
-        assert!(validate_turbo(&p, &bad_e, 0).is_ok());
     }
 
     #[test]

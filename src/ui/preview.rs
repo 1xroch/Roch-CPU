@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use super::model::{AmdInfo, CoreInfo, HeaderInfo, IntelInfo, LiveReadings, LogSink, TurboTable, UiModel};
+use super::model::{AmdInfo, CoreInfo, HeaderInfo, IntelInfo, LiveReadings, LogSink, UiModel};
 use crate::model::memory_voltage_link::{MemoryVoltageGrid, MemoryVoltageLink};
 use crate::model::setting::{Setting, SettingGroup};
 
@@ -229,7 +229,7 @@ impl UiModel for PreviewModel {
                     10
                 };
                 let base = if rail == "VPP" { 1500 } else { 800 };
-                Some((s.id.clone(), MemoryVoltageGrid { base_millivolts: base, step_millivolts: step }))
+                Some((s.id.clone(), MemoryVoltageGrid { base_millivolts: base, step_millivolts: step, max_code: 127 }))
             })
             .collect()
     }
@@ -242,16 +242,16 @@ impl UiModel for PreviewModel {
     fn apply_curve_optimizer(&self, _core: &CoreInfo, _margin: i32) -> Result<()> {
         bail!("UI preview does not write hardware.")
     }
-    fn read_p_core_turbo_table(&self) -> Result<TurboTable> {
+    fn read_p_core_ratio_ceilings(&self) -> Result<Vec<i32>> {
         bail!("UI preview does not read hardware.")
     }
-    fn read_e_core_turbo_table(&self) -> Result<TurboTable> {
-        bail!("UI preview does not read hardware.")
-    }
-    fn write_p_core_turbo_table(&self, _ratios: &[i32]) -> Result<()> {
+    fn write_p_core_ratio_ceilings(&self, _ratios: &[i32]) -> Result<()> {
         bail!("UI preview does not write hardware.")
     }
-    fn write_e_core_turbo_table(&self, _ratios: &[i32]) -> Result<()> {
+    fn read_e_cluster_ratios(&self) -> Result<Vec<(String, i32)>> {
+        bail!("UI preview does not read hardware.")
+    }
+    fn write_e_cluster_ratios(&self, _ratios: &[i32]) -> Result<()> {
         bail!("UI preview does not write hardware.")
     }
 }
@@ -332,8 +332,8 @@ mod tests {
         let m = PreviewModel::new(PreviewOptions::default());
         let g = m.memory_grids();
         assert_eq!(g.len(), 6);
-        assert_eq!(g["dimma1_vpp"], MemoryVoltageGrid { base_millivolts: 1500, step_millivolts: 5 });
-        assert_eq!(g["dimmb1_vddq"], MemoryVoltageGrid { base_millivolts: 800, step_millivolts: 10 });
+        assert_eq!(g["dimma1_vpp"], MemoryVoltageGrid { base_millivolts: 1500, step_millivolts: 5, max_code: 127 });
+        assert_eq!(g["dimmb1_vddq"], MemoryVoltageGrid { base_millivolts: 800, step_millivolts: 10, max_code: 127 });
         let e = PreviewModel::new(PreviewOptions { voltage_readings: Some("error".into()), ..Default::default() });
         assert_eq!(e.memory_grids()["dimmb1_vddq"].step_millivolts, 0);
         assert!(e.core_voltage_target_read_failed());

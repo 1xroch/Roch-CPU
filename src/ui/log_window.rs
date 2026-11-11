@@ -36,6 +36,8 @@ pub struct LogWindow {
     pub open: bool,
     /// Beside the main window, where it was when the log was opened.
     pub position: Option<Pos2>,
+    /// The size the user last gave it; reopening keeps it, as hiding the .NET form did.
+    size: Option<Vec2>,
     theme_sent: theme::TitleTheme,
 }
 
@@ -47,15 +49,19 @@ impl LogWindow {
         }
         let mut builder = ViewportBuilder::default()
             .with_title(format!("{APP_NAME} - Log"))
-            .with_inner_size(vec2(620.0, 420.0))
+            .with_inner_size(self.size.unwrap_or(vec2(620.0, 420.0)))
             .with_taskbar(false)
             .with_icon(icon.clone());
         if let Some(p) = self.position {
             builder = builder.with_position(p);
         }
         let theme_sent = &mut self.theme_sent;
+        let size = &mut self.size;
         let close = ctx.show_viewport_immediate(ViewportId::from_hash_of(VIEWPORT), builder, |ui, _class| {
             theme_sent.sync(ui.ctx());
+            if let Some(r) = ui.input(|i| i.viewport().inner_rect) {
+                *size = Some(r.size());
+            }
             let rect = ui.max_rect();
             ui.painter().rect_filled(rect, 0.0, theme::bg());
             let inner = rect.shrink(8.0);

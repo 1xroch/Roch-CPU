@@ -164,7 +164,23 @@ impl Vdd2Rail {
     pub fn restore(&self) -> Result<bool> {
         let Some(code) = self.baseline_code() else { return Ok(false) };
         let ok = self.write_code(code)?;
-        let volts = self.baseline_volts();
+        // Let the rail settle before anyone reads it: the model re-reads the Super I/O straight
+        // after a restore, and without this it reported the pre-restore voltage as the restored
+        // one ("restored default (1.388 V)" with the regulator already back at 1.380 V). This is
+        // the same measured settle set_volts does after each step. The NCT6687D's monitor only
+        // refreshes about once a second, so keep sampling (up to ~1.5 s) until the rail is back
+        // within a few millivolts of the start-up reading.
+        let mut measured = None;
+        if ok {
+            let baseline = self.baseline_volts();
+            for _ in 0..12 {
+                measured = self.measure_rail(3);
+                if measured.is_some_and(|v| (v - baseline).abs() <= 0.006) {
+                    break;
+                }
+            }
+        }
+        let volts = measured.unwrap_or_else(|| self.baseline_volts());
         self.set_status(if ok { format!("restored to {volts:.3} V") } else { "restore FAILED".to_string() });
         Ok(ok)
     }

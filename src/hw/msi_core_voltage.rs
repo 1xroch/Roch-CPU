@@ -457,6 +457,45 @@ impl MsiCoreVoltage {
         outcome
     }
 
+    /// The regulator's second output (PAGE 1) as `(mode, target mV, secondary mV)`. The only write
+    /// is the PAGE pointer: PAGE 1 is selected if needed, the three registers are read, and the
+    /// original PAGE is put back and verified - the mirror of the start-up core PAGE 0 check.
+    pub fn read_page1_raw(&self) -> Result<Option<(u16, u16, u16)>> {
+        let _guard = self.op_lock.lock();
+        if !self.acquire()? {
+            bail!("timed out waiting for the regulator bus");
+        }
+        let mut original: Option<u8> = None;
+        let body = (|| -> Result<Option<(u16, u16, u16)>> {
+            let page = self.read_byte(R_PAGE)?;
+            if !(page == 0 || page == 1) {
+                return Ok(None);
+            }
+            original = Some(page);
+            if page != 1 {
+                self.write_byte(R_PAGE, 1)?;
+            }
+            let s = self.read_state_core(1)?;
+            if self.read_byte(R_PAGE)? != 1 {
+                bail!("Regulator PAGE changed while reading PAGE 1.");
+            }
+            Ok(Some((s.mode_register, s.target_mv, s.secondary_target_mv)))
+        })();
+        let restore = (|| -> Result<()> {
+            if let Some(p) = original {
+                if self.read_byte(R_PAGE).ok() != Some(p) {
+                    self.write_byte(R_PAGE, p)?;
+                }
+                if self.read_byte(R_PAGE)? != p {
+                    bail!("Original regulator PAGE restoration did not read back.");
+                }
+            }
+            Ok(())
+        })();
+        let r = with_finally(body, restore);
+        with_finally(r, self.release())
+    }
+
     /// Set the board regulator to the requested millivolt target. This is the precise ordering used
     /// by MSI Dragon Power: disable another active target, program VOUT_COMMAND, then select mode 3.
     pub fn set_override(&self, volts: f64) -> Result<()> {

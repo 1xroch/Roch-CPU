@@ -18,6 +18,8 @@ use super::pmic_voltage_measurement::PmicVoltageMeasurement;
 
 const ADC_RAIL_VOLTS_PER_LSB: f64 = 0.015; // 15 mV / LSB for SWA..SWD
 const CALIBRATION_TOLERANCE_V: f64 = 0.060; // ADC accuracy + ripple
+/// ADC reads tried per rail before a PMIC is treated as secure-mode (read-only).
+const CALIBRATION_ATTEMPTS: usize = 3;
 
 /// Mutable state (the C# private setters), behind one mutex so the DIMM is `Send + Sync`.
 struct DimmState {
@@ -25,6 +27,8 @@ struct DimmState {
     pmic_vendor: String,
     vdd_step_mv: i32,
     vddq_step_mv: i32,
+    /// Calibration found the 0x23 VDDQ extension present and consistent (see `calibrate`).
+    vddq_extension: bool,
     vpp_verified: bool,
     adc_writable: bool,
     calibration_note: String,
@@ -76,6 +80,13 @@ impl Ddr5Dimm {
     pub const R_SWB_VOUT: u8 = 0x23; // VDD second phase (0 = follows SWA)
     pub const R_SWC_VOUT: u8 = 0x25; // VDDQ : bits 7:1, 800 mV base, 5 or 10 mV per step (calibrated)
     pub const R_SWD_VOUT: u8 = 0x27; // VPP  : bits 7:1, 1500 mV base, 5 mV per step
+    /// PMIC ID 8A12 only: VDDQ above the 1.435 V top of SWC's 5 mV range. MSI Dragon Power sets
+    /// SWC to its top code, enables bit 3 of 0x2B and puts the extra in 0x23, 5 mV per count
+    /// (read on the Z790 MPOWER: 1.500 V = 0xFE + 13, 1.460 V = 0xFE + 5, 0x2B 0x62 -> 0x6A).
+    pub const R_VDDQ_EXTENSION: u8 = 0x23;
+    pub const R_VDDQ_EXTENSION_CTRL: u8 = 0x2B;
+    pub const VDDQ_EXTENSION_ENABLE: u8 = 0x08;
+    const VDDQ_EXTENSION_PMIC: &'static str = "ID 8A12";
     pub const R_ADC_ENABLE: u8 = 0x30; // bit 7 = enable, bits 6:3 = input select
     pub const R_ADC_READ: u8 = 0x31;
     pub const R_VENDOR_LSB: u8 = 0x3B;
@@ -90,9 +101,14 @@ impl Ddr5Dimm {
     pub const ADC_VIN_BULK: i32 = 5;
 
     pub const VDD_MIN_V: f64 = 0.800;
-    pub const VDD_MAX_V: f64 = 1.800;
+    /// DIMM VDD / VDDQ limits match MSI Dragon Power (0.800-2.500 V); the PMIC register itself
+    /// tops out lower (2.070 V at 10 mV, 1.435 V at 5 mV without the VDDQ extension).
+    pub const VDD_MAX_V: f64 = 2.500;
     pub const VDDQ_MIN_V: f64 = 0.800;
-    pub const VDDQ_MAX_V: f64 = 1.500;
+    pub const VDDQ_MAX_V: f64 = 2.500;
+    /// VDDQ cap where the 0x23 extension is available: Dragon Power's 2.500 V (SWC top 1.435 V
+    /// plus 213 extension counts, within the register's 255).
+    pub const VDDQ_EXTENSION_MAX_V: f64 = 2.500;
     pub const VPP_MIN_V: f64 = 1.500;
     pub const VPP_MAX_V: f64 = 2.135;
 
@@ -113,6 +129,7 @@ impl Ddr5Dimm {
                 pmic_vendor: "?".to_string(),
                 vdd_step_mv: 0,
                 vddq_step_mv: 0,
+                vddq_extension: false,
                 vpp_verified: false,
                 adc_writable: false,
                 calibration_note: "not calibrated".to_string(),
@@ -171,7 +188,27 @@ impl Ddr5Dimm {
     }
     pub fn vddq_ceiling_v(&self) -> f64 {
         let step = self.vddq_step_mv();
+        if self.has_vddq_extension() {
+            return Self::VDDQ_EXTENSION_MAX_V;
+        }
         if step != 0 { Self::VDDQ_MAX_V.min(decode(0xFE, 800, step)) } else { Self::VDDQ_MAX_V }
+    }
+
+    /// Whether VDDQ can go above SWC's 1.435 V top through register 0x23 (PMIC ID 8A12, 5 mV step).
+    pub fn has_vddq_extension(&self) -> bool {
+        let st = lock(&self.state);
+        st.vddq_extension && st.pmic_vendor == Self::VDDQ_EXTENSION_PMIC && st.vddq_step_mv == 5
+    }
+
+    /// The VDDQ extension in force, in volts (0 when disabled); `None` if it could not be read.
+    /// Only meaningful on the PMIC that has it; callers check the vendor first.
+    fn read_vddq_extension_v(&self) -> Option<f64> {
+        let pmic = self.pmic_address();
+        let ctrl = self.bus.read_byte(pmic, Self::R_VDDQ_EXTENSION_CTRL)?;
+        if ctrl & Self::VDDQ_EXTENSION_ENABLE == 0 {
+            return Some(0.0);
+        }
+        Some(self.bus.read_byte(pmic, Self::R_VDDQ_EXTENSION)? as f64 * 0.005)
     }
 
     /// Why a rail stops at 1.435 V. Seen on a G.Skill kit (PMIC 8A12): with the BIOS at 1.41 V the PMIC
@@ -317,6 +354,7 @@ impl Ddr5Dimm {
             let mut st = lock(&self.state);
             st.vdd_step_mv = 0;
             st.vddq_step_mv = 0;
+            st.vddq_extension = false;
             st.vpp_verified = false;
             st.adc_writable = false;
             if !st.has_pmic {
@@ -327,10 +365,26 @@ impl Ddr5Dimm {
         if !has_pmic {
             return;
         }
-        let adc_a = self.read_adc_volts(Self::ADC_SWA);
-        let adc_c = self.read_adc_volts(Self::ADC_SWC);
-        let adc_d = self.read_adc_volts(Self::ADC_SWD);
-        let (Some(adc_a), Some(adc_c), Some(adc_d)) = (adc_a, adc_c, adc_d) else {
+        // One missed ADC-select readback is not proof of secure mode: on the Z790 MPOWER a DIMM
+        // that calibrated fine on every other start-up occasionally failed once (another SMBus
+        // user, or the PMIC busy), which left it read-only and decoded at the wrong step size.
+        // Only the ADC mux is touched, so retrying is harmless; a real secure-mode PMIC fails
+        // every attempt.
+        let mut adc = (None, None, None);
+        for attempt in 0..CALIBRATION_ATTEMPTS {
+            if attempt > 0 {
+                native::sleep_ms(50);
+            }
+            adc = (
+                adc.0.or_else(|| self.read_adc_volts(Self::ADC_SWA)),
+                adc.1.or_else(|| self.read_adc_volts(Self::ADC_SWC)),
+                adc.2.or_else(|| self.read_adc_volts(Self::ADC_SWD)),
+            );
+            if adc.0.is_some() && adc.1.is_some() && adc.2.is_some() {
+                break;
+            }
+        }
+        let (Some(adc_a), Some(adc_c), Some(adc_d)) = adc else {
             lock(&self.state).calibration_note =
                 "PMIC ADC not writable (secure mode) - voltage scales unverified, writes disabled".to_string();
             return;
@@ -354,7 +408,19 @@ impl Ddr5Dimm {
         } else if m10 && !m5 {
             vdd_step = 10;
         }
-        let q5 = (decode(rc, 800, 5) - adc_c).abs() <= CALIBRATION_TOLERANCE_V;
+        // The 0x23 extension was seen on one ID 8A12 kit. Only treat 0x23 as a VDDQ extension when
+        // it looks like one: zero with the enable bit clear, or set with the bit set - and never
+        // equal to the VDD setpoint, which is what a genuine second VDD phase (SWB) looks like.
+        let ext_plausible = self.pmic_vendor() == Self::VDDQ_EXTENSION_PMIC && {
+            let pmic = self.pmic_address();
+            match (self.bus.read_byte(pmic, Self::R_VDDQ_EXTENSION_CTRL), self.bus.read_byte(pmic, Self::R_VDDQ_EXTENSION)) {
+                (Some(ctrl), Some(r23)) if ctrl & Self::VDDQ_EXTENSION_ENABLE == 0 => r23 == 0,
+                (Some(_), Some(r23)) => r23 != 0 && r23 != ra,
+                _ => false,
+            }
+        };
+        let ext = if ext_plausible { self.read_vddq_extension_v().unwrap_or(0.0) } else { 0.0 };
+        let q5 = (decode(rc, 800, 5) + ext - adc_c).abs() <= CALIBRATION_TOLERANCE_V;
         let q10 = (decode(rc, 800, 10) - adc_c).abs() <= CALIBRATION_TOLERANCE_V;
         let mut vddq_step = 0;
         if q5 && !q10 {
@@ -366,6 +432,7 @@ impl Ddr5Dimm {
         let mut st = lock(&self.state);
         st.vdd_step_mv = vdd_step;
         st.vddq_step_mv = vddq_step;
+        st.vddq_extension = ext_plausible && vddq_step == 5;
         st.vpp_verified = vpp_verified;
         let vdd_text = if vdd_step != 0 { format!("{vdd_step} mV") } else { "unknown".to_string() };
         let vddq_text = if vddq_step != 0 { format!("{vddq_step} mV") } else { "unknown".to_string() };
@@ -390,7 +457,11 @@ impl Ddr5Dimm {
     }
     pub fn read_vddq(&self) -> Option<f64> {
         let step = self.vddq_step_mv();
-        self.read_rail(Self::R_SWC_VOUT, 800, if step != 0 { step } else { 5 })
+        let base = self.read_rail(Self::R_SWC_VOUT, 800, if step != 0 { step } else { 5 })?;
+        if self.has_vddq_extension() {
+            return Some(base + self.read_vddq_extension_v()?);
+        }
+        Some(base)
     }
     pub fn read_vpp(&self) -> Option<f64> {
         self.read_rail(Self::R_SWD_VOUT, 1500, 5)
@@ -468,10 +539,16 @@ impl Ddr5Dimm {
             bail!("{}", msg.trim_end());
         }
         let v = encode(volts, 800, step);
+        // Second VDD phase (SWB) mirrors SWA on dual-rail PMICs; 0 means it follows SWA and must be
+        // left alone. Mirror it only when it really was a copy of SWA: on this kit's PMIC (ID 8A12)
+        // register 0x23 is not a VDD phase but the VDDQ extension MSI Dragon Power uses above
+        // 1.435 V (0x23 = 13 -> +65 mV), and copying a VDD code (e.g. 0x8C) into it would push
+        // VDDQ up by ~0.7 V.
+        let swa_before = self.bus.read_byte(self.pmic_address(), Self::R_SWA_VOUT);
+        let swb_before = self.bus.read_byte(self.pmic_address(), Self::R_SWB_VOUT);
         self.write_rail(Self::R_SWA_VOUT, v, "VDD", Self::ADC_SWA, decode(v, 800, step))?;
-        // Second VDD phase (SWB) mirrors SWA on dual-rail PMICs; 0 means it follows SWA and must be left alone.
-        if let Some(swb) = self.bus.read_byte(self.pmic_address(), Self::R_SWB_VOUT) {
-            if swb != 0 {
+        if let (Some(swa), Some(swb)) = (swa_before, swb_before) {
+            if swb != 0 && swb == swa {
                 self.bus.write_byte(self.pmic_address(), Self::R_SWB_VOUT, v);
             }
         }
@@ -489,8 +566,80 @@ impl Ddr5Dimm {
             let msg = format!("VDDQ must be {:.3}-{ceiling:.3} V. {}", Self::VDDQ_MIN_V, Self::step_limit_note(step));
             bail!("{}", msg.trim_end());
         }
+        if self.has_vddq_extension() {
+            return self.write_vddq_extended(volts);
+        }
         let v = encode(volts, 800, step);
         self.write_rail(Self::R_SWC_VOUT, v, "VDDQ", Self::ADC_SWC, decode(v, 800, step))
+    }
+
+    /// A byte register written and read back in full (the extension uses bit 0 too).
+    fn write_register_verified(&self, reg: u8, value: u8, what: &str) -> Result<()> {
+        let pmic = self.pmic_address();
+        if !self.bus.write_byte(pmic, reg, value) {
+            bail!("{}: SMBus write to PMIC register 0x{reg:02X} ({what}) failed.", self.slot_name);
+        }
+        native::sleep_ms(5);
+        match self.bus.read_byte(pmic, reg) {
+            Some(back) if back == value => Ok(()),
+            other => bail!(
+                "{}: PMIC rejected {what} 0x{value:02X} (read back {}).",
+                self.slot_name,
+                other.map_or("nothing".to_string(), |b| format!("0x{b:02X}"))
+            ),
+        }
+    }
+
+    /// VDDQ on the PMIC with the 0x23 extension, the way MSI Dragon Power writes it. Never passes
+    /// through a higher voltage than the start or the target: going down, the extension is cleared
+    /// before SWC moves; going up, SWC reaches its top before the extension is added.
+    fn write_vddq_extended(&self, volts: f64) -> Result<()> {
+        let pmic = self.pmic_address();
+        let top = decode(0xFE, 800, 5); // 1.435 V
+        let ext_counts = if volts > top + 1e-9 { ((volts - top) / 0.005).round() as i64 } else { 0 };
+        if !(0..=0xFF).contains(&ext_counts) {
+            bail!("VDDQ {volts:.3} V is outside the PMIC extension range.");
+        }
+        let ctrl = self
+            .bus
+            .read_byte(pmic, Self::R_VDDQ_EXTENSION_CTRL)
+            .ok_or_else(|| anyhow::anyhow!("{}: PMIC register 0x2B could not be read.", self.slot_name))?;
+        let enabled = ctrl & Self::VDDQ_EXTENSION_ENABLE != 0;
+        let current_ext = if enabled { self.bus.read_byte(pmic, Self::R_VDDQ_EXTENSION).unwrap_or(0) } else { 0 };
+        if ext_counts == 0 {
+            if current_ext != 0 {
+                self.write_register_verified(Self::R_VDDQ_EXTENSION, 0, "VDDQ extension")?;
+            }
+            let v = encode(volts, 800, 5);
+            return self.write_rail(Self::R_SWC_VOUT, v, "VDDQ", Self::ADC_SWC, decode(v, 800, 5));
+        }
+        // Above 1.435 V: lower an existing extension first if it is above the new one, so the
+        // move to SWC's top cannot overshoot.
+        if current_ext as i64 > ext_counts {
+            self.write_register_verified(Self::R_VDDQ_EXTENSION, ext_counts as u8, "VDDQ extension")?;
+        }
+        if !enabled {
+            // Enable with a zero extension, so switching it on changes nothing by itself.
+            self.write_register_verified(Self::R_VDDQ_EXTENSION, 0, "VDDQ extension")?;
+            self.write_register_verified(
+                Self::R_VDDQ_EXTENSION_CTRL,
+                ctrl | Self::VDDQ_EXTENSION_ENABLE,
+                "VDDQ extension enable",
+            )?;
+        }
+        let ext_now = if enabled && current_ext as i64 <= ext_counts { current_ext } else { ext_counts.min(current_ext as i64) as u8 };
+        self.write_rail(Self::R_SWC_VOUT, 0xFE, "VDDQ", Self::ADC_SWC, top + ext_now as f64 * 0.005)?;
+        self.write_register_verified(Self::R_VDDQ_EXTENSION, ext_counts as u8, "VDDQ extension")?;
+        native::sleep_ms(20);
+        if let Some(m) = self.read_adc_volts(Self::ADC_SWC) {
+            if (m - volts).abs() > CALIBRATION_TOLERANCE_V + 0.03 {
+                bail!(
+                    "{}: VDDQ extension accepted but the ADC measures {m:.3} V instead of {volts:.3} V.                      Check the value with another monitoring tool before going further.",
+                    self.slot_name
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn write_vpp(&self, volts: f64) -> Result<()> {
@@ -532,6 +681,8 @@ mod tests {
         registers: HashMap<u8, u8>,
         trace: Vec<String>,
         next_failure: Failure,
+        /// Model the ID 8A12 PMIC: VDDQ at 5 mV plus the 0x23 extension when 0x2B bit 3 is set.
+        vddq_extension: bool,
     }
 
     struct FakeBus(Mutex<FakeBusState>);
@@ -539,7 +690,7 @@ mod tests {
     impl FakeBus {
         fn new() -> Arc<FakeBus> {
             let registers = HashMap::from([(0x30, 0), (0x21, 120), (0x23, 0), (0x25, 110), (0x27, 120)]);
-            Arc::new(FakeBus(Mutex::new(FakeBusState { registers, trace: Vec::new(), next_failure: Failure::None })))
+            Arc::new(FakeBus(Mutex::new(FakeBusState { registers, trace: Vec::new(), next_failure: Failure::None, vddq_extension: false })))
         }
         fn with_failure(failure: Failure) -> Arc<FakeBus> {
             let b = FakeBus::new();
@@ -588,6 +739,10 @@ mod tests {
                 let r = |k: u8| st.registers.get(&k).copied().unwrap_or(0) as i32;
                 let volts = match select {
                     0 => (800 + 10 * (r(0x21) >> 1)) as f64 / 1000.0,
+                    2 if st.vddq_extension => {
+                        let ext = if r(0x2B) & 0x08 != 0 { 5 * r(0x23) } else { 0 };
+                        (800 + 5 * (r(0x25) >> 1) + ext) as f64 / 1000.0
+                    }
                     2 => (800 + 10 * (r(0x25) >> 1)) as f64 / 1000.0,
                     3 => (1500 + 5 * (r(0x27) >> 1)) as f64 / 1000.0,
                     _ => 1.2,
@@ -682,9 +837,9 @@ mod tests {
         let old_p = after.vpp_measurement();
         let old_a = after.vdd_measurement();
         after.write_vdd(1.44).unwrap();
-        let mut expected = vec!["W 48:21=80".to_string(), "R 48:21".to_string()];
+        // SWA and SWB are read before the write so SWB is mirrored only if it was a copy of SWA.
+        let mut expected = vec!["R 48:21".to_string(), "R 48:23".to_string(), "W 48:21=80".to_string(), "R 48:21".to_string()];
         expected.extend(adc_trace(0x80));
-        expected.push("R 48:23".to_string());
         assert_eq!(bus.trace(), expected, "Apply verification added/reordered a bus operation");
         let a = after.vdd_measurement();
         assert!(
@@ -771,6 +926,86 @@ mod tests {
     #[test]
     fn legacy_adc_trace_return_preserved_fail_restore_write() {
         check_adc_trace(Failure::FailRestoreWrite, adc_trace(0x80), VDD_ADC);
+    }
+
+    #[test]
+    fn vdd_write_leaves_a_non_mirror_register_0x23_alone() {
+        let bus = FakeBus::new();
+        let dimm = dimm_on(&bus);
+        dimm.calibrate();
+        lock(&bus.0).registers.insert(0x23, 0x0D); // VDDQ extension, not a copy of SWA
+        dimm.write_vdd(1.44).unwrap();
+        assert_eq!(lock(&bus.0).registers[&0x23], 0x0D, "VDD write overwrote register 0x23");
+        lock(&bus.0).registers.insert(0x23, 0x80); // a genuine SWB mirror of SWA (0x80)
+        dimm.write_vdd(1.45).unwrap();
+        let (swa, swb) = {
+            let st = lock(&bus.0);
+            (st.registers[&0x21], st.registers[&0x23])
+        };
+        assert_eq!(swb, swa, "mirrored SWB not updated");
+    }
+
+    #[test]
+    fn vddq_extension_goes_above_1435_like_dragon_power_and_comes_back_without_overshoot() {
+        let bus = FakeBus::new();
+        {
+            let mut st = lock(&bus.0);
+            st.vddq_extension = true;
+            st.registers.insert(0x25, 0xF4); // 1.410 V at 5 mV
+            st.registers.insert(0x2B, 0x62);
+        }
+        let dimm = dimm_on(&bus);
+        lock(&dimm.state).pmic_vendor = "ID 8A12".into();
+        dimm.calibrate();
+        assert!(dimm.has_vddq_extension() && dimm.vddq_step_mv() == 5, "{}", dimm.calibration_note());
+        assert!((dimm.vddq_ceiling_v() - Ddr5Dimm::VDDQ_EXTENSION_MAX_V).abs() < 1e-9);
+
+        dimm.write_vddq(1.46).unwrap();
+        let (swc, ext, ctrl) = {
+            let st = lock(&bus.0);
+            (st.registers[&0x25], st.registers[&0x23], st.registers[&0x2B])
+        };
+        assert_eq!((swc, ext, ctrl), (0xFE, 5, 0x6A), "not Dragon Power's 1.460 V encoding");
+        assert!((dimm.read_vddq().unwrap() - 1.46).abs() < 1e-9);
+
+        bus.clear_trace();
+        dimm.write_vddq(1.42).unwrap();
+        let t = bus.trace();
+        let clear = t.iter().position(|x| x == "W 48:23=00").expect("extension not cleared");
+        let lower = t.iter().position(|x| x == "W 48:25=F8").expect("SWC not lowered");
+        assert!(clear < lower, "SWC lowered before the extension was cleared: {t:?}");
+        assert!((dimm.read_vddq().unwrap() - 1.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_vdd_phase_in_0x23_is_not_taken_for_the_vddq_extension() {
+        let bus = FakeBus::new();
+        {
+            let mut st = lock(&bus.0);
+            st.vddq_extension = true;
+            st.registers.insert(0x25, 0xF4);
+            st.registers.insert(0x2B, 0x6A); // enable bit set...
+            st.registers.insert(0x23, 120); // ...but 0x23 equals SWA (0x21 = 120): a VDD phase
+        }
+        let dimm = dimm_on(&bus);
+        lock(&dimm.state).pmic_vendor = "ID 8A12".into();
+        dimm.calibrate();
+        assert!(!dimm.has_vddq_extension(), "a mirrored VDD phase was taken for the VDDQ extension");
+    }
+
+    #[test]
+    fn one_missed_adc_selection_does_not_mark_the_pmic_secure_mode() {
+        let bus = FakeBus::with_failure(Failure::FailSelectionReadBack);
+        let dimm = dimm_on(&bus);
+        dimm.calibrate();
+        assert!(
+            dimm.vdd_step_mv() == 10 && dimm.vddq_step_mv() == 10 && dimm.vpp_verified(),
+            "A single transient ADC failure left the DIMM unverified: {}",
+            dimm.calibration_note()
+        );
+        // The failed VDD sample was retried once; VDDQ and VPP were each read only once.
+        let selects = bus.trace().iter().filter(|t| t.starts_with("W 48:30=") && !t.ends_with("=00")).count();
+        assert_eq!(selects, 4, "unexpected ADC selections: {:?}", bus.trace());
     }
 
     #[test]
@@ -957,7 +1192,7 @@ mod tests {
         let bus = FakePmicBus::new(10, 1.450);
         let dimm = single(&bus);
         assert!(
-            dimm.vdd_step_mv() == 10 && (dimm.vdd_ceiling_v() - Ddr5Dimm::VDD_MAX_V).abs() < 1e-9,
+            dimm.vdd_step_mv() == 10 && (dimm.vdd_ceiling_v() - 2.070).abs() < 1e-9, // register top at 10 mV
             "10 mV step ceiling wrong"
         );
         dimm.write_vdd(1.5).unwrap();

@@ -34,7 +34,24 @@ impl Report {
 
 /// Local time in .NET's round-trip ("O") format.
 pub(crate) fn now_o() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.7f%:z").to_string()
+    local_o(&chrono::Local::now())
+}
+
+/// `t` in .NET's round-trip ("O") format: seven fractional digits and a `+hh:mm` offset.
+/// chrono has no `%.7f` (only `%.3f`, `%.6f` and `%.9f`); asking for it makes the formatter fail
+/// and `to_string()` panic, so the 100 ns ticks are written out by hand.
+pub(crate) fn local_o(t: &chrono::DateTime<chrono::Local>) -> String {
+    format!("{}.{:07}{}", t.format("%Y-%m-%dT%H:%M:%S"), ticks(t), t.format("%:z"))
+}
+
+/// A UTC time in .NET's round-trip ("O") format, e.g. `2026-11-10T21:08:42.1234567Z`.
+pub(crate) fn utc_o(t: &chrono::DateTime<chrono::Utc>) -> String {
+    format!("{}.{:07}Z", t.format("%Y-%m-%dT%H:%M:%S"), ticks(t))
+}
+
+/// Sub-second part in 100 ns ticks. A leap second reports nanoseconds >= 1e9; fold it back.
+fn ticks(t: &impl chrono::Timelike) -> u32 {
+    (t.nanosecond() % 1_000_000_000) / 100
 }
 
 fn tf(b: bool) -> &'static str {
@@ -412,5 +429,20 @@ pub fn run(path: &Path) -> i32 {
             log(&format!("{e:?}"));
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn round_trip_timestamps_have_seven_fraction_digits_and_do_not_panic() {
+        let t = Utc.with_ymd_and_hms(2026, 11, 10, 21, 8, 42).unwrap() + chrono::Duration::nanoseconds(123_456_789);
+        assert_eq!(super::utc_o(&t), "2026-11-10T21:08:42.1234567Z");
+        let local = super::now_o();
+        let frac = local.split('.').nth(1).expect("fraction");
+        assert!(frac[..7].bytes().all(|b| b.is_ascii_digit()), "{local}");
+        assert!(matches!(&frac[7..8], "+" | "-"), "{local}");
     }
 }

@@ -305,6 +305,38 @@ pub fn wrapped_label(ui: &mut Ui, text: &str, font: FontId, color: Color32, max_
     response
 }
 
+/// `Label: value` on one wrapped line, the label in `label_color` and everything after the first
+/// `": "` in `value_color`. A line without a separator is drawn entirely in `label_color`.
+pub fn key_value_label(ui: &mut Ui, line: &str, font: FontId, label_color: Color32, value_color: Color32, max_width: f32) -> Response {
+    let width = ui.available_width().min(max_width).max(10.0);
+    let galley = key_value_galley(ui, line, font, label_color, value_color, width);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width().max(galley.size().x), galley.size().y), Sense::hover());
+    ui.painter().galley(rect.min, galley, label_color);
+    response
+}
+
+/// The laid-out text of [`key_value_label`], for callers that position it themselves.
+pub fn key_value_galley(
+    ui: &Ui,
+    line: &str,
+    font: FontId,
+    label_color: Color32,
+    value_color: Color32,
+    width: f32,
+) -> Arc<egui::Galley> {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = width;
+    match line.split_once(": ") {
+        Some((label, value)) => {
+            job.append(&format!("{label}: "), 0.0, TextFormat::simple(font.clone(), label_color));
+            job.append(value, 0.0, TextFormat::simple(font, value_color));
+        }
+        None => job.append(line, 0.0, TextFormat::simple(font, label_color)),
+    }
+    ui.painter().layout_job(job)
+}
+
 /// Flat button in an exact rectangle: plate in the panel colour, grey border, red border on
 /// hover. Primary = solid red.
 pub fn button_at(ui: &mut Ui, rect: Rect, label: &str, primary: bool, enabled: bool, font: FontId) -> Response {

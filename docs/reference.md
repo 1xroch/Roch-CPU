@@ -41,11 +41,11 @@ voltages and board rails on one, the SMU's limits and Curve Optimizer on the oth
 
 | Control | Path | Works on |
 |---|---|---|
-| CPU ratio (all-core and the per-active-core-count table) | MSR 0x1AD / 0x1AE | unlocked multiplier (Z-series + K CPU). Elsewhere *OC Lock* rejects the write and the window says so |
+| CPU ratio (all-core), and per P-core / per E-core cluster | MSR 0x1AD / 0x650, plus the per-core ratio ceiling (OC mailbox 0x1C/0x1D) on every core | unlocked multiplier (Z-series + K CPU). Elsewhere *OC Lock* rejects the write and the window says so |
 | E-core ratio | MSR 0x650 | same |
 | Ring ratio | OC mailbox + MSR 0x620 (the MSR alone is ignored on Alder/Raptor Lake) | same |
 | CPU Core voltage override | Renesas regulator over the MSI EC I²C mailbox, then Intel OC mailbox domain 0 | tested Z790MPOWER and supported MSI 600/700-series boards with a Nuvoton EC; both targets are read back and Vcore is measured |
-| E-core L2 / Ring / SA / GT voltage, offset or override | Intel OC mailbox (MSR 0x150) over the CPU's SVID path | every board, **if the VRM follows SVID**. On Raptor Lake SA is domain 4 and E-core L2 domain 5; published tables often say 3 |
+| E-core L2 / SA / GT voltage, offset or override | Intel OC mailbox (MSR 0x150) over the CPU's SVID path. There is no Ring voltage row: on LGA1700 the ring runs on the Vcore rail | every board, **if the VRM follows SVID**. On Raptor Lake SA is domain 4 and E-core L2 domain 5; published tables often say 3 |
 | PL1 / PL2 power limits | MSR 0x610 | every board unless locked in BIOS |
 | Base clock | the board's clock generator, over the EC's I²C mailbox | MSI 600/700-series with a Nuvoton EC. Read-only elsewhere |
 | CPU VDD2 | the board's regulator, over the same mailbox | same boards; clamped to 1.100–1.450 V |
@@ -190,7 +190,11 @@ produces `target\release\roch-cpu.exe`; `build.cmd` renames it and copies its su
 
 ## Safety
 
-* Voltages above the usual daily-use range ask for confirmation. Nothing stops you confirming.
+* There are no confirmation prompts on voltages (removed in 1.0.7). Every write is still
+  range-checked, read back, and verified against the rail or the PMIC ADC where one exists.
+* A voltage offset is refused while that rail is in override mode, and restoring a voltage
+  returns it to the override the BIOS set, not to Auto: switching a fixed SA to adaptive
+  voltage hard-froze the Z790MPOWER test system with overclocked DDR5.
 * DDR5 PMIC register scales differ between kits — overclocking kits use 10 mV steps where JEDEC
   says 5 mV, which would double a voltage written with the wrong scale. Roch CPU calibrates every
   rail against the PMIC's own ADC at start-up, enables writing only where the scale matches, and

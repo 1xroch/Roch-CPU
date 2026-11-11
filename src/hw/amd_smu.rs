@@ -945,6 +945,16 @@ impl AmdSmu {
     }
 
     pub fn set_curve_optimizer(&self, ccd: i32, core_in_ccd: i32, margin: i32) -> Result<()> {
+        // APUs take the plain core index (0-7), which the 0xFFF00000 mask below clears: every
+        // per-core write would carry the same core field and land on one core (inherited from the
+        // .NET build). Until the APU core encoding is confirmed on hardware, refuse rather than
+        // undervolt the wrong core. The all-core message needs no core address and still works.
+        if self.messages.is_apu {
+            bail!(
+                "Per-core Curve Optimizer is not supported on this APU yet (its core addressing is unverified); \
+                 use the all-core Curve Optimizer value instead."
+            );
+        }
         let margin = margin.clamp(-self.messages.co_range, self.messages.co_range);
         let st = self.send_co(
             self.messages.mp1_set_co_margin,

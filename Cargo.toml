@@ -1,6 +1,6 @@
 [package]
 name = "roch-cpu"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2024"
 description = "Roch CPU - open CPU tuning for LGA1700 and AMD Ryzen"
 authors = ["Roch Studio"]
@@ -37,6 +37,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Registry",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

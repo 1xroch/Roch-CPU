@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use anyhow::Result;
 use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexExW, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+};
 
 use super::native::{self, OwnedHandle, lock, wide};
 use super::{KernelDriver, Smbus};
@@ -21,9 +23,15 @@ impl SmbusGlobalMutex {
 
     /// `None` when the mutex cannot be created or opened (the .NET build then ran without it).
     pub(crate) fn create() -> Option<SmbusGlobalMutex> {
+        // Open with the rights .NET's `new Mutex(false, name)` requests, not CreateMutexW's
+        // MUTEX_ALL_ACCESS: a mutex another monitoring tool created with a restrictive DACL must
+        // still be shared, or SPD/PMIC transactions would interleave with that tool's on the bus.
+        const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
         let name = wide(Self::NAME);
         // SAFETY: FFI call with a valid NUL-terminated name; a null return is handled.
-        let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        let h = unsafe {
+            CreateMutexExW(std::ptr::null(), name.as_ptr(), 0, MAXIMUM_ALLOWED | SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE)
+        };
         if h.is_null() { None } else { Some(SmbusGlobalMutex(OwnedHandle(h))) }
     }
 
@@ -83,11 +91,9 @@ const PROTO_BLOCK_DATA: u8 = 5 << 2;
 const STS_BYTE_DONE: u8 = 0x80;
 const BLOCK_DB: u16 = 0x07;
 
-/// `Thread.SpinWait(n)`.
+/// `Thread.SpinWait(n)`; see `native::spin_wait`.
 fn spin_wait(iterations: u32) {
-    for _ in 0..iterations {
-        std::hint::spin_loop();
-    }
+    native::spin_wait(iterations);
 }
 
 impl SmbusI801 {

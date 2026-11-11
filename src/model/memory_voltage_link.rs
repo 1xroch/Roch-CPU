@@ -9,6 +9,9 @@ use super::setting::{Setting, SettingGroup};
 pub struct MemoryVoltageGrid {
     pub base_millivolts: i32,
     pub step_millivolts: i32,
+    /// Highest code the rail accepts: 127 for a plain 7-bit PMIC setpoint, more where an extension
+    /// (the ID 8A12 PMIC's VDDQ register 0x23) carries the rail further.
+    pub max_code: i32,
 }
 
 /// An honest shared-editor projection; constructing it never changes any target.
@@ -184,7 +187,7 @@ impl MemoryVoltageLink {
         // avoids rounding a request differently on two PMICs with different calibrated steps.
         let first = self.grid(&members[0].id).unwrap();
         let mut common = Vec::new();
-        for code in 0..=127i64 {
+        for code in 0..=first.max_code.max(0) as i64 {
             let value = (first.base_millivolts as i64 + code * first.step_millivolts as i64) as f64 / 1000.0;
             if members.iter().all(|s| self.is_supported(s, value)) {
                 common.push(value);
@@ -221,13 +224,17 @@ impl MemoryVoltageLink {
             return Err(Some("Use Split DIMMs to restore individual startup values; those values may differ.".into()));
         }
         if !group.supported_values.iter().any(|v| (v - value).abs() < TOLERANCE) {
-            let step = group.step().map(|s| format!(" in {} mV steps.", trim_3(s * 1000.0))).unwrap_or_else(|| ".".into());
-            return Err(Some(format!(
-                "{} must use a common supported target from {:.3} to {:.3} V{step}",
-                group.rail,
-                group.minimum().unwrap_or(0.0),
-                group.maximum().unwrap_or(0.0)
-            )));
+            // Reason first: the window shows this in a one-line footer that cuts off the tail.
+            let (min, max) = (group.minimum().unwrap_or(0.0), group.maximum().unwrap_or(0.0));
+            let step = group.step().map(|s| format!(" in {} mV steps", trim_3(s * 1000.0))).unwrap_or_default();
+            let why = if value > max + TOLERANCE {
+                format!("{value:.3} V is above the {max:.3} V maximum")
+            } else if value < min - TOLERANCE {
+                format!("{value:.3} V is below the {min:.3} V minimum")
+            } else {
+                format!("{value:.3} V is not a supported step")
+            };
+            return Err(Some(format!("{}: {why} ({min:.3}-{max:.3} V{step}).", group.rail)));
         }
         Ok(group.members.iter().map(|s| (s.id.clone(), s.format(value))).collect())
     }
@@ -278,7 +285,7 @@ impl MemoryVoltageLink {
         }
         let Some(grid) = self.grid(&setting.id) else { return false };
         let code = (value * 1000.0 - grid.base_millivolts as f64) / grid.step_millivolts as f64;
-        code >= -TOLERANCE && code <= 127.0 + TOLERANCE && (code - code.round()).abs() < TOLERANCE
+        code >= -TOLERANCE && code <= grid.max_code as f64 + TOLERANCE && (code - code.round()).abs() < TOLERANCE
     }
 }
 
@@ -317,7 +324,7 @@ mod tests {
 
     fn grids(ids: &[&str], base: i32, step: i32) -> HashMap<String, MemoryVoltageGrid> {
         ids.iter()
-            .map(|id| (id.to_string(), MemoryVoltageGrid { base_millivolts: base, step_millivolts: step }))
+            .map(|id| (id.to_string(), MemoryVoltageGrid { base_millivolts: base, step_millivolts: step, max_code: 127 }))
             .collect()
     }
 
@@ -338,7 +345,9 @@ mod tests {
         assert_eq!(staged.len(), 2);
         assert_eq!(staged["dimmb1_vdd"], "1.250");
         let err = link.try_stage(&rows, "dimma1_vdd", "1.2512").unwrap_err().unwrap();
-        assert!(err.contains("in 5 mV steps."), "{err}");
+        assert!(err.contains("is not a supported step") && err.contains("in 5 mV steps)."), "{err}");
+        let err = link.try_stage(&rows, "dimma1_vdd", "1.440").unwrap_err().unwrap();
+        assert!(err.starts_with("VDD: 1.440 V is above the 1.435 V maximum"), "{err}");
         assert!(link.try_stage(&rows, "dimma1_vdd", "0").is_err());
     }
 

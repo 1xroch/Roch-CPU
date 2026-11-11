@@ -24,6 +24,20 @@ use crate::hw::smbus_i801::SmbusI801;
 use crate::hw::super_io::SuperIo;
 use crate::model::hardware_model::HardwareModel;
 
+/// `println!` that never panics. Rust's `println!` panics when stdout is a pipe whose reader has
+/// gone (`roch-cpu --bclk-set 101 | Select-Object -First 3`), and several switches print between a
+/// hardware write and its restore - a panic there would leave the test value in place. .NET's
+/// console ignored those errors; so do these.
+macro_rules! out {
+    () => {{ use std::io::Write as _; let _ = writeln!(std::io::stdout()); }};
+    ($($t:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stdout(), $($t)*); }};
+}
+
+/// `eprintln!` that never panics; see `out!`.
+macro_rules! err {
+    ($($t:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stderr(), $($t)*); }};
+}
+
 fn eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -57,7 +71,7 @@ fn parse_u32(s: &str) -> Option<u32> {
 /// A model with the log routed to stderr, as most diagnostic modes use.
 fn model_logging_to_stderr() -> HardwareModel {
     let hw = HardwareModel::new();
-    hw.on_log(|m| eprintln!("{m}"));
+    hw.on_log(|m| err!("{m}"));
     hw.initialize();
     hw
 }
@@ -133,14 +147,14 @@ pub fn run(args: &[String]) -> i32 {
             _ => 0,
         };
         let Some(volts) = parse_f64(&args[2]) else {
-            println!("'{}' is not a number", args[2]);
+            out!("'{}' is not a number", args[2]);
             return 1;
         };
         return asus_audit::validate_rail(&dir.join(format!("asus-{}-validation.txt", args[1])), id, volts);
     }
     if args.len() > 1 && eq(a0, "--intel-validate") {
         let Some(volts) = parse_f64(&args[1]) else {
-            println!("'{}' is not a number", args[1]);
+            out!("'{}' is not a number", args[1]);
             return 1;
         };
         return intel_audit::validate(&dir.join("intel-validation.txt"), volts);
@@ -150,7 +164,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     if args.len() > 1 && eq(a0, "--ecore-validate") {
         let Ok(target) = args[1].parse::<i32>() else {
-            println!("'{}' is not a number", args[1]);
+            out!("'{}' is not a number", args[1]);
             return 1;
         };
         return intel_audit::validate_e_core(&dir.join("ecore-validation.txt"), target);
@@ -165,7 +179,7 @@ pub fn run(args: &[String]) -> i32 {
         for r in &restrictions {
             lines.push(format!(
                 "{} MSR 0x{:X} write={} driver={}",
-                r.time_utc.format("%Y-%m-%dT%H:%M:%S%.7fZ"),
+                intel_audit::utc_o(&r.time_utc),
                 r.register,
                 if r.is_write { "True" } else { "False" },
                 r.driver
@@ -181,7 +195,7 @@ pub fn run(args: &[String]) -> i32 {
         return smu_command(&args[1..]);
     }
     if args.len() > 2 && eq(a0, "--apply") {
-        return apply_setting(&args[1], &args[2]);
+        return apply_settings(&args[1..]);
     }
     if args.len() > 1 && eq(a0, "--smn") {
         let count = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
@@ -190,7 +204,7 @@ pub fn run(args: &[String]) -> i32 {
     if eq(a0, "--smb-regs") {
         let hw = model_quiet();
         let Some(bus) = hw.smbus() else {
-            println!("no SMBus");
+            out!("no SMBus");
             return 1;
         };
         let addrs: [u8; 7] = [0x44, 0x48, 0x4A, 0x50, 0x52, 0x70, 0x72];
@@ -202,7 +216,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         let _ = std::fs::write(args.get(1).map(String::as_str).unwrap_or("smb.bin"), &out);
         let vcore = hw.super_io().and_then(|s| s.read_voltage(SuperIo::RAIL_VCORE));
-        println!(
+        out!(
             "dumped {} addresses x 256 regs; Vcore {} V",
             addrs.len(),
             vcore.map(|v| format!("{v:.3}")).unwrap_or_default()
@@ -227,23 +241,23 @@ pub fn run(args: &[String]) -> i32 {
     if eq(a0, "--smbus-reset") {
         let hw = model_quiet();
         let Some(bus) = hw.smbus() else {
-            println!("no SMBus");
+            out!("no SMBus");
             return 1;
         };
         // Recovery is Intel-specific: SSRESET lives in the PCH's HSTCFG register, and the
         // AMD (PIIX4) controller has no equivalent.
         let Some(bus9) = bus.as_any().downcast_ref::<SmbusI801>() else {
-            println!(
+            out!(
                 "SMBus recovery is only implemented for the Intel PCH controller; this system has {}.",
                 bus.description()
             );
             return 1;
         };
-        println!("soft reset : {}", bus9.reset().unwrap_or_else(|e| e.to_string()));
-        println!("host reset : {}", bus9.hard_reset().unwrap_or_else(|e| e.to_string()));
+        out!("soft reset : {}", bus9.reset().unwrap_or_else(|e| e.to_string()));
+        out!("host reset : {}", bus9.hard_reset().unwrap_or_else(|e| e.to_string()));
         for attempt in 1..=3 {
             let found = Ddr5Dimm::probe(bus.clone());
-            println!(
+            out!(
                 "attempt {attempt}: {} DDR5 module(s) {}",
                 found.len(),
                 found.iter().map(|d| format!("{}@0x{:02X}", d.slot_name(), d.spd_address())).collect::<Vec<_>>().join(", ")
@@ -262,7 +276,7 @@ pub fn run(args: &[String]) -> i32 {
         // reads with the documented unlock/lock sequence - no polling, nothing written.
         let hw = model_quiet();
         let Some(drv) = hw.driver() else {
-            println!("no driver");
+            out!("no driver");
             return 1;
         };
         let r: anyhow::Result<()> = (|| {
@@ -283,7 +297,7 @@ pub fn run(args: &[String]) -> i32 {
                     drv.write_io_port_byte(port, 0xAA)?;
                     continue;
                 }
-                println!("LPC 0x{port:02X}: chip 0x{id:02X}{rev:02X}");
+                out!("LPC 0x{port:02X}: chip 0x{id:02X}{rev:02X}");
                 for ldn in 0..=0x1Fu8 {
                     wr(0x07, ldn)?;
                     let active = rd(0x30)?;
@@ -295,14 +309,14 @@ pub fn run(args: &[String]) -> i32 {
                     if active == 0 && b0 == 0 && b1 == 0 {
                         continue;
                     }
-                    println!("   LDN 0x{ldn:02X}  active={active:02X}  base0=0x{b0:04X}  base1=0x{b1:04X}");
+                    out!("   LDN 0x{ldn:02X}  active={active:02X}  base0=0x{b0:04X}  base1=0x{b1:04X}");
                 }
                 drv.write_io_port_byte(port, 0xAA)?;
             }
             Ok(())
         })();
         if let Err(e) = r {
-            println!("{e}");
+            out!("{e}");
             return 1;
         }
         return 0;
@@ -311,16 +325,16 @@ pub fn run(args: &[String]) -> i32 {
     if eq(a0, "--bclk-test") {
         let hw = model_quiet();
         let (Some(cpu), Some(meter)) = (hw.cpu(), hw.bclk().filter(|b| b.is_available())) else {
-            println!("no CPU / BCLK meter");
+            out!("no CPU / BCLK meter");
             return 1;
         };
-        println!("Comparing the two ways of measuring BCLK.");
-        println!("  base ratio {}", cpu.base_ratio());
+        out!("Comparing the two ways of measuring BCLK.");
+        out!("  base ratio {}", cpu.base_ratio());
         for _ in 0..3 {
             let tsc = meter.measure_bclk_mhz(cpu.base_ratio(), 60).unwrap_or(f64::NAN);
             let core = meter.measure_bclk_from_core(cpu.first_p_thread(), 200).ok().flatten();
             let cycles = meter.measure_bclk_from_cycles(cpu.first_p_thread(), 150).ok().flatten();
-            println!(
+            out!(
                 "  TSC {:>8}   APERF/MPERF {:>8}   core cycles {:>8} MHz",
                 format!("{tsc:.3}"),
                 core.map(|v| format!("{v:.3}")).unwrap_or_default(),
@@ -332,9 +346,9 @@ pub fn run(args: &[String]) -> i32 {
 
     if eq(a0, "--clkgen") {
         let hw = model_logging_to_stderr();
-        println!("{}", hw.super_io_status());
+        out!("{}", hw.super_io_status());
         let Some(sio) = hw.super_io().filter(|s| EcClockGen::is_supported(Some(s))) else {
-            println!("no EC mailbox on this Super I/O");
+            out!("no EC mailbox on this Super I/O");
             return 1;
         };
         let generator = EcClockGen::new(EcMailbox::new(sio));
@@ -345,9 +359,9 @@ pub fn run(args: &[String]) -> i32 {
                 _ => None,
             };
             match blk {
-                Err(e) => println!("  {e}"),
-                Ok(None) => println!("  clock generator did not answer"),
-                Ok(Some(b)) => println!(
+                Err(e) => out!("  {e}"),
+                Ok(None) => out!("  clock generator did not answer"),
+                Ok(Some(b)) => out!(
                     "  {}   measured {} MHz",
                     EcClockGen::describe(&b),
                     mhz.map(|v| format!("{v:.3}")).unwrap_or_default()
@@ -364,20 +378,20 @@ pub fn run(args: &[String]) -> i32 {
     if eq(a0, "--vdd2") {
         let hw = model_logging_to_stderr();
         let Some(rail) = hw.vdd2() else {
-            println!("CPU VDD2 is not settable on this board");
+            out!("CPU VDD2 is not settable on this board");
             return 1;
         };
-        println!("baseline: {}", rail.status());
+        out!("baseline: {}", rail.status());
         if args.len() < 2 {
-            println!("usage: --vdd2 <volts>   (omit to just report)");
+            out!("usage: --vdd2 <volts>   (omit to just report)");
             return 0;
         }
         let Some(target) = parse_f64(&args[1]) else {
-            println!("usage: --vdd2 <volts>   (omit to just report)");
+            out!("usage: --vdd2 <volts>   (omit to just report)");
             return 1;
         };
-        let ok = rail.set_volts(target, Some(&|m: &str| println!("{m}"))).unwrap_or_else(|e| { println!("{e}"); false });
-        println!("{}{}", if ok { "ok: " } else { "FAILED: " }, rail.status());
+        let ok = rail.set_volts(target, Some(&|m: &str| out!("{m}"))).unwrap_or_else(|e| { out!("{e}"); false });
+        out!("{}{}", if ok { "ok: " } else { "FAILED: " }, rail.status());
         return if ok { 0 } else { 1 };
     }
 
@@ -402,11 +416,40 @@ pub fn run(args: &[String]) -> i32 {
         return smbus_scan(&arg_or(args, 1, dir.join("smbus.txt")));
     }
 
+    if eq(a0, "--vr-page1") {
+        // The MSI core regulator's second output (PAGE 1). Not read-only: it selects PAGE 1 if
+        // needed and puts the original PAGE back - two writes to the regulator's PAGE pointer.
+        // Close other tools that drive the regulator (MSI Dragon Power) before running it.
+        let hw = model_quiet();
+        let Some(cv) = hw.core_voltage() else {
+            out!("no MSI core regulator");
+            return 1;
+        };
+        return match cv.read_page1_raw() {
+            Ok(Some((mode, target, secondary))) => {
+                out!(
+                    "PAGE 1: mode register 0x{mode:04X} (mode {}), target {target} mV ({:.3} V), secondary {secondary} mV",
+                    (mode >> 4) & 3,
+                    target as f64 / 1000.0
+                );
+                0
+            }
+            Ok(None) => {
+                out!("regulator is not on PAGE 1; nothing read (no page change attempted)");
+                1
+            }
+            Err(e) => {
+                out!("{e}");
+                1
+            }
+        };
+    }
+
     if eq(a0, "--vtest") {
         return voltage_test(&arg_or(args, 1, dir.join("vtest.txt")));
     }
 
-    println!("Unknown option {a0}. Run with --help for the list.");
+    out!("Unknown option {a0}. Run with --help for the list.");
     1
 }
 
@@ -423,11 +466,11 @@ fn bclk_tools(args: &[String]) -> i32 {
     let a0 = args[0].as_str();
     let hw = model_logging_to_stderr();
     let Some(sio) = hw.super_io().filter(|s| EcClockGen::is_supported(Some(s))) else {
-        println!("no EC mailbox on this Super I/O");
+        out!("no EC mailbox on this Super I/O");
         return 1;
     };
     let (Some(cpu), Some(meter)) = (hw.cpu(), hw.bclk().filter(|b| b.is_available())) else {
-        println!("no BCLK meter");
+        out!("no BCLK meter");
         return 1;
     };
 
@@ -437,22 +480,22 @@ fn bclk_tools(args: &[String]) -> i32 {
         Box::new(move || meter.measure_bclk_from_cycles(thread, 150).ok().flatten()),
     );
     if !ctl.capture_baseline().unwrap_or_else(|e| {
-        println!("{e}");
+        out!("{e}");
         false
     }) {
-        println!("{}", ctl.status());
+        out!("{}", ctl.status());
         return 1;
     }
-    println!("{}", ctl.status());
-    let print = |m: &str| println!("{m}");
+    out!("{}", ctl.status());
+    let print = |m: &str| out!("{m}");
 
     if eq(a0, "--clkgen-dump") {
         // Read-only sweep of the clock generator, to find what else on it moves with the
         // base clock. Word reads overlap by a byte, so the low byte of each is the map.
         let gen_d = EcMailbox::new(sio);
-        let from = args.get(1).and_then(|s| i32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0x00);
-        let to = args.get(2).and_then(|s| i32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0xFF);
-        println!("clock generator 0x{:02X}, registers 0x{from:02X}-0x{to:02X}", EcClockGen::CLOCK_GEN_ADDRESS);
+        let from = args.get(1).and_then(|s| i32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()).unwrap_or(0x00);
+        let to = args.get(2).and_then(|s| i32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()).unwrap_or(0xFF);
+        out!("clock generator 0x{:02X}, registers 0x{from:02X}-0x{to:02X}", EcClockGen::CLOCK_GEN_ADDRESS);
         let mut b = from & !0xF;
         while b <= to {
             let mut cells = Vec::new();
@@ -467,7 +510,7 @@ fn bclk_tools(args: &[String]) -> i32 {
                     }
                 });
             }
-            println!("  {b:02X}: {}", cells.join(" "));
+            out!("  {b:02X}: {}", cells.join(" "));
             b += 16;
         }
         return 0;
@@ -482,30 +525,30 @@ fn bclk_tools(args: &[String]) -> i32 {
             match parsed {
                 Some(p) => divs = p,
                 None => {
-                    println!("dividers must be numbers");
+                    out!("dividers must be numbers");
                     return 1;
                 }
             }
         }
-        let ok = ctl.probe_dividers(&divs, Some(&print)).unwrap_or_else(|e| { println!("{e}"); false });
-        println!("{}{}", if ok { "" } else { "FAILED: " }, ctl.status());
+        let ok = ctl.probe_dividers(&divs, Some(&print)).unwrap_or_else(|e| { out!("{e}"); false });
+        out!("{}{}", if ok { "" } else { "FAILED: " }, ctl.status());
         return if ok { 0 } else { 1 };
     }
 
     if eq(a0, "--bclk-cal") {
-        let ok = ctl.calibrate(Some(&print)).unwrap_or_else(|e| { println!("{e}"); false });
-        println!("{}{}", if ok { "calibrated: " } else { "FAILED: " }, ctl.status());
+        let ok = ctl.calibrate(Some(&print)).unwrap_or_else(|e| { out!("{e}"); false });
+        out!("{}{}", if ok { "calibrated: " } else { "FAILED: " }, ctl.status());
         return if ok { 0 } else { 1 };
     }
 
     let Some(want) = args.get(1).and_then(|s| parse_f64(s)) else {
-        println!("usage: --bclk-set <MHz>");
+        out!("usage: --bclk-set <MHz>");
         return 1;
     };
     // No pre-calibration: set_bclk establishes the scale from its own first read, the same
     // way the Base Clock row does, so this measures what the application actually costs.
-    let set = ctl.set_bclk(want, Some(&print)).unwrap_or_else(|e| { println!("{e}"); false });
-    println!("{}{}", if set { "ok: " } else { "FAILED: " }, ctl.status());
+    let set = ctl.set_bclk(want, Some(&print)).unwrap_or_else(|e| { out!("{e}"); false });
+    out!("{}{}", if set { "ok: " } else { "FAILED: " }, ctl.status());
     if set { 0 } else { 1 }
 }
 
@@ -515,7 +558,7 @@ fn bclk_tools(args: &[String]) -> i32 {
 fn vcore_test(report_path: &Path) -> i32 {
     let mut sb = String::new();
     macro_rules! w {
-        ($($t:tt)*) => {{ let s = format!($($t)*); println!("{s}"); sb.push_str(&s); sb.push_str("\r\n"); }};
+        ($($t:tt)*) => {{ let s = format!($($t)*); out!("{s}"); sb.push_str(&s); sb.push_str("\r\n"); }};
     }
     let hw = model_quiet();
     let Some(cpu) = hw.cpu() else {
@@ -562,7 +605,7 @@ fn vcore_test(report_path: &Path) -> i32 {
                 "{name:<22}: VID {:.3} V ({d_vid:+.0} mV), real Vcore {:.3} V ({d_rail:+.0} mV)",
                 m.0, m.1
             );
-            println!("{line}");
+            out!("{line}");
             sb.push_str(&line);
             sb.push_str("\r\n");
             results.push((name.to_string(), d_vid, d_rail));
@@ -906,7 +949,7 @@ fn voltage_test(report_path: &Path) -> i32 {
 fn smu_command(a: &[String]) -> i32 {
     let hw = model_quiet();
     let Some(amd) = hw.amd().filter(|_| hw.smu_available()) else {
-        println!("No AMD SMU.");
+        out!("No AMD SMU.");
         return 1;
     };
     let smu = amd.smu();
@@ -918,11 +961,11 @@ fn smu_command(a: &[String]) -> i32 {
         _ => None,
     };
     let Some(mb) = mb else {
-        println!("mailbox must be rsmu, mp1 or hsmp");
+        out!("mailbox must be rsmu, mp1 or hsmp");
         return 1;
     };
     let Some(msg) = parse_u32(&a[1]) else {
-        println!("'{}' is not a number", a[1]);
+        out!("'{}' is not a number", a[1]);
         return 1;
     };
     let mut margs = [0u32; 6];
@@ -930,7 +973,7 @@ fn smu_command(a: &[String]) -> i32 {
         match parse_u32(&a[i]) {
             Some(v) => margs[i - 2] = v,
             None => {
-                println!("'{}' is not a number", a[i]);
+                out!("'{}' is not a number", a[i]);
                 return 1;
             }
         }
@@ -944,7 +987,7 @@ fn smu_command(a: &[String]) -> i32 {
         st.code(),
         margs.iter().map(|x| format!("0x{x:08X}")).collect::<Vec<_>>().join(" ")
     );
-    println!("{line}");
+    out!("{line}");
     append_file(&app_dir().join("smu.txt"), &format!("[{}] {line}\r\n", chrono::Local::now().format("%H:%M:%S")));
     if st == SmuStatus::Ok { 0 } else { 2 }
 }
@@ -954,11 +997,11 @@ fn smn_dump(start: &str, count: i32) -> i32 {
     let mut sb = String::new();
     let hw = model_quiet();
     let Some(amd) = hw.amd() else {
-        println!("No AMD CPU.");
+        out!("No AMD CPU.");
         return 1;
     };
     let Some(a0) = parse_u32(start) else {
-        println!("'{start}' is not a number");
+        out!("'{start}' is not a number");
         return 1;
     };
     for i in 0..count.max(0) as u32 {
@@ -977,7 +1020,7 @@ fn smn_dump(start: &str, count: i32) -> i32 {
             }
             None => format!("0x{a:08X} = read failed"),
         };
-        println!("{line}");
+        out!("{line}");
         sb.push_str(&line);
         sb.push_str("\r\n");
     }
@@ -985,25 +1028,45 @@ fn smn_dump(start: &str, count: i32) -> i32 {
     0
 }
 
-/// Applies one row by id through the same path the window uses: --apply ppt 150. Logs to the console and apply.txt.
-fn apply_setting(id: &str, text: &str) -> i32 {
+/// Applies rows by id through the same path the window uses: `--apply ppt 150`. Logs to the
+/// console and apply.txt.
+/// `--apply row value [row value ...]`: the pairs run in order in one process, so `0` (restore the
+/// value captured at start-up) refers to the state before the first pair. Stops at the first
+/// failure and returns its code.
+fn apply_settings(pairs: &[String]) -> i32 {
+    if pairs.len() % 2 != 0 {
+        out!("usage: --apply <row> <value> [<row> <value> ...]");
+        return 1;
+    }
+    let hw = HardwareModel::new();
     let sb = Arc::new(std::sync::Mutex::new(String::new()));
     let w = {
         let sb = sb.clone();
         move |m: &str| {
-            println!("{m}");
+            out!("{m}");
             let mut b = native::lock(&sb);
             b.push_str(m);
             b.push_str("\r\n");
         }
     };
-    let hw = HardwareModel::new();
     {
         let w = w.clone();
         hw.on_log(move |m| w(&format!("  log: {m}")));
     }
     hw.initialize();
-    let rc = match hw.setting(id) {
+    let mut rc = 0;
+    for pair in pairs.chunks(2) {
+        rc = apply_one(&hw, &w, &pair[0], &pair[1]);
+        if rc != 0 {
+            break;
+        }
+    }
+    append_file(&app_dir().join("apply.txt"), &native::lock(&sb));
+    rc
+}
+
+fn apply_one(hw: &HardwareModel, w: &dyn Fn(&str), id: &str, text: &str) -> i32 {
+    match hw.setting(id) {
         None => {
             let ids: Vec<String> = hw.settings().iter().map(|s| s.id.clone()).collect();
             w(&format!("no row '{id}'. Rows: {}", ids.join(", ")));
@@ -1022,9 +1085,7 @@ fn apply_setting(id: &str, text: &str) -> i32 {
                 if ok { 0 } else { 2 }
             }
         },
-    };
-    append_file(&app_dir().join("apply.txt"), &native::lock(&sb));
-    rc
+    }
 }
 
 /// Dumps the whole SMU power table as index / offset / float, for layout research on a new firmware.
@@ -1069,7 +1130,7 @@ fn pm_dump(report_path: &Path) -> i32 {
         let _ = write!(out, "{i:>5}  0x{:04X}  {}\r\n", i * 4, trim_4(*v as f64));
     }
     write_file(report_path, &out);
-    println!("wrote {} floats to {}", t.len(), report_path.display());
+    out!("wrote {} floats to {}", t.len(), report_path.display());
     0
 }
 
@@ -1101,7 +1162,7 @@ fn trim_3_10(v: f32) -> String {
 
 /// Lists the switches.
 fn help() -> i32 {
-    println!(
+    out!(
         "Roch CPU {} - CPU and memory tuning for Intel LGA1700 and AMD Ryzen.
 Run with no arguments for the window. Everything below needs administrator rights.
 
@@ -1139,6 +1200,8 @@ CPU VDD2 (Intel, MSI EC boards)
   --vdd2                report the regulator's code and the measured rail.
   --vdd2 <volts>        set it, one code step at a time, measuring the rail after each.
 
+  --vr-page1           the MSI core regulator's PAGE 1 output (switches PAGE and back).
+
 Buses and sensors
   --sio-dump            every Super I/O voltage channel.
   --sio-ldn             the Super I/O's logical devices and their I/O windows.
@@ -1147,7 +1210,9 @@ Buses and sensors
   --smbus-reset         recover an SMBus wedged by another tool (Intel PCH only).
 
 AMD
-  --apply <row> <value> apply one row through the same path the window uses.
+  --apply <row> <value> [<row> <value> ...]
+                        apply rows through the same path the window uses, in order,
+                        in one process (0 restores the value found at start-up).
   --smu <rsmu|mp1|hsmp> <0xMSG> [args]   send one raw mailbox message. Research only:
                         it goes straight to the firmware with no checking.
   --pm-dump [file]      the SMU power table (needs PawnIO).
@@ -1239,6 +1304,18 @@ fn probe_body(hw: &HardwareModel, w: &dyn Fn(&str)) -> anyhow::Result<()> {
                 er.iter().enumerate().map(|(i, r)| format!("{}c={r}", ec[i])).collect::<Vec<_>>().join(" ")
             ));
         }
+        let clusters = cpu.e_core_clusters();
+        if !clusters.is_empty() {
+            w(&format!(
+                "E clusters  : {}   ratio limits {}",
+                clusters.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(" "),
+                cpu.read_e_cluster_ratio_ceilings().iter().map(|r| r.map_or("?".into(), |v| v.to_string())).collect::<Vec<_>>().join(" ")
+            ));
+        }
+        w(&format!(
+            "P-core limits: {}",
+            cpu.read_p_core_ratio_ceilings().iter().map(|r| r.map_or("?".into(), |v| v.to_string())).collect::<Vec<_>>().join(" ")
+        ));
         let ring = cpu.read_ring_ratio()?;
         w(&format!("Ring         : max {} min {} current {}", ring.0, ring.1, cpu.read_current_ring_ratio()));
         let pl = cpu.read_package_power_limits()?;

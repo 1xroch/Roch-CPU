@@ -74,13 +74,6 @@ pub struct CoreInfo {
     pub location: String,
 }
 
-/// An Intel turbo ratio table: the ratio for each group and how many cores the group covers.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TurboTable {
-    pub ratios: Vec<i32>,
-    pub cores: Vec<i32>,
-}
-
 /// Everything the main window, the log, the per-core ratio window and the Curve Optimizer
 /// window ask of the model. Calls that touch hardware block; the window runs the slow ones
 /// (apply, restore, base-clock measurement, initialization) on worker threads.
@@ -149,8 +142,11 @@ pub trait UiModel: Send + Sync {
     fn apply_curve_optimizer(&self, core: &CoreInfo, margin: i32) -> Result<()>;
 
     // ---- Intel turbo ratio tables
-    fn read_p_core_turbo_table(&self) -> Result<TurboTable>;
-    fn read_e_core_turbo_table(&self) -> Result<TurboTable>;
-    fn write_p_core_turbo_table(&self, ratios: &[i32]) -> Result<()>;
-    fn write_e_core_turbo_table(&self, ratios: &[i32]) -> Result<()>;
+    /// Each physical P-core's own ratio limit (MSI Dragon Power's "Per Core Ratio"), core order.
+    fn read_p_core_ratio_ceilings(&self) -> Result<Vec<i32>>;
+    fn write_p_core_ratio_ceilings(&self, ratios: &[i32]) -> Result<()>;
+    /// One ratio per E-core cluster (E-cores share a clock in clusters of four), labelled the way
+    /// HWiNFO numbers the cores, e.g. "E-cores 6-9". Empty when there are no E-cores.
+    fn read_e_cluster_ratios(&self) -> Result<Vec<(String, i32)>>;
+    fn write_e_cluster_ratios(&self, ratios: &[i32]) -> Result<()>;
 }
