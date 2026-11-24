@@ -35,6 +35,9 @@ fn run() -> i32 {
         if args.first().is_some_and(|a| a == ui::CONFIRM_ARG) {
             return ui::run_confirm_dialog(&args[1..]);
         }
+        if args.first().is_some_and(|a| a == "setup") {
+            return hw::linux::setup::run(&args[1..]);
+        }
     }
 
     // The diagnostic switches print to the console they were launched from; a windows-subsystem

@@ -17,3 +17,6 @@ rm -f "$here/.RochCPU.desktop.tmp"
 install -Dm644 "$icon" "$data/icons/hicolor/256x256/apps/RochCPU.png"
 command -v update-desktop-database >/dev/null && update-desktop-database "$data/applications" || true
 echo "Installed: $HOME/.local/bin/rochcpu (launcher: Roch CPU)"
+if [ -e /usr/local/bin/rochcpu ]; then
+  echo "Run 'sudo $HOME/.local/bin/rochcpu setup' again so the password-free helper matches this version."
+fi

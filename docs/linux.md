@@ -6,6 +6,12 @@ The same window, rows and safety rules as on Windows, on Wayland or X11. There i
 
 The window runs as your user. Register access needs root, and a Wayland client should not run as root: the compositor socket, settings and fonts belong to the person at the desk. So at launch Roch CPU starts itself a second time through `pkexec` (`rochcpu --hardware-helper`), and the two talk over a pipe, one register call per message. Closing the window closes the pipe, and the helper exits. Roch Viewer uses the same design.
 
+### No password at each launch
+
+By default `pkexec` asks for your password every time the window starts. `sudo ~/.local/bin/rochcpu setup` stops that: it copies this program to `/usr/local/bin/rochcpu`, owned by root and writable only by root, and writes `/etc/polkit-1/rules.d/49-rochcpu.rules`, which lets the person who ran it start exactly `/usr/local/bin/rochcpu --hardware-helper` from their own active local session without a password. A rule naming the copy in `~/.local/bin` would hand out root, since anything running as you can replace that file; nobody but root can change the copy in `/usr/local/bin`.
+
+The trade: anything running as you can then start the helper silently and do what it allows, which is changing CPU ratios, voltages and power limits and the DIMM rails. The window uses the installed copy only while it is byte for byte the running build, so after an update it asks again until setup is re-run. `rochcpu setup --status` reports the state, `rochcpu setup --show` lists what it would change, and `sudo rochcpu setup --undo` removes both files.
+
 Install with `packaging/linux/install.sh` (the binary as `~/.local/bin/rochcpu`, a launcher entry and its icon), or run `target/release/roch-cpu` from the build directly. Run as root (`sudo rochcpu --probe`), Roch CPU uses the interfaces directly and no helper starts. `ROCHCPU_NO_HELPER=1` stops it asking at all, and `ROCHCPU_LOG=1` mirrors the Log window to stderr.
 
 | Windows (WinRing0) | Linux |

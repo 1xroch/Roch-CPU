@@ -23,6 +23,7 @@ pub mod direct;
 pub mod helper;
 pub mod protocol;
 pub mod proxy;
+pub mod setup;
 
 use std::sync::Arc;
 

@@ -1,6 +1,6 @@
 [package]
 name = "roch-cpu"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2024"
 description = "Roch CPU - open CPU tuning for Intel LGA1700 and LGA1851 and AMD Ryzen, on Windows and Linux"
 authors = ["Roch Studio"]

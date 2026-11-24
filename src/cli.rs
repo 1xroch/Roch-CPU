@@ -1333,8 +1333,25 @@ fn core_offset_probe() -> i32 {
         out!("{label}: wrote 0x{word:08X}, status {:?}, reads {:?}", answer.as_ref().map(|a| a.0), after.as_ref().map(|a| format!("0x{:08X}", a.1)));
         if let Ok((_, now)) = after {
             if now != original {
-                let back = mb.execute(OcMailbox::CMD_WRITE_VF, 0, 0, original);
-                out!("  restore: status {:?}, reads {:?}", back.map(|a| a.0), read().map(|a| format!("0x{:08X}", a.1)));
+                // The CPU answers 0x08 (busy) while it applies the change just made, so the
+                // put-back is retried until the domain reads as it did.
+                let mut restored = false;
+                for attempt in 0..20 {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    let back = mb.execute(OcMailbox::CMD_WRITE_VF, 0, 0, original);
+                    let reads = read();
+                    out!("  restore: status {:?}, reads {:?}", back.map(|a| a.0), reads.as_ref().map(|a| format!("0x{:08X}", a.1)));
+                    if matches!(reads, Ok((_, value)) if value == original) {
+                        restored = true;
+                        break;
+                    }
+                }
+                if !restored {
+                    out!("  NOT RESTORED: domain 0 should read 0x{original:08X}. Set the core offset back in Roch CPU or reboot.");
+                    return 1;
+                }
             }
         }
     }
@@ -1364,6 +1381,10 @@ Reporting
                        closes no apps, requires one instance, restores snapshots.
                         Attach this when reporting a board that misbehaves.
   --help                this list.
+
+Linux: stop asking for the password at each launch
+  setup                 install a root-owned copy and a polkit rule (run with sudo).
+  setup --status | --show | --undo
 
 Checking a control that seems to do nothing
   --write-test [file]   write every Intel row a small step, measure the effect (clocks under

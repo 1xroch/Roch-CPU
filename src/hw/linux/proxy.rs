@@ -34,9 +34,10 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    /// Starts this executable as the helper through `pkexec`.
+    /// Starts this executable as the helper through `pkexec`: the copy `rochcpu setup` installed
+    /// when it is this same build, which polkit then lets start without a password.
     pub fn start() -> std::result::Result<Proxy, String> {
-        let exe = std::env::current_exe().map_err(|e| format!("Could not find this program: {e}"))?;
+        let exe = super::setup::helper_program().map_err(|e| format!("Could not find this program: {e}"))?;
         let mut pkexec = Command::new("pkexec");
         // pkexec refuses to run at all when SHELL is not listed in /etc/shells, as one installed
         // by a version manager often is, and it has no use for the value.

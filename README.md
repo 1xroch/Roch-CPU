@@ -15,10 +15,15 @@ If Windows blocks the driver (Memory Integrity or the vulnerable-driver blocklis
 ### Linux
 
 1. Download `Roch-CPU-<version>-linux-x86_64.tar.gz` from [Releases](https://github.com/1xroch/Roch-CPU/releases), extract it and run its `install.sh`; or build it (below) and run `packaging/linux/install.sh`. Either puts `rochcpu` in `~/.local/bin` and adds **Roch CPU** to your launcher.
-2. Run it as your normal user. The window stays an ordinary Wayland or X11 app; a small helper (the same program, started through `pkexec`) does the register access as root and asks for your password at each launch.
+2. Run it as your normal user. The window stays an ordinary Wayland or X11 app; a small helper (the same program, started through `pkexec`) does the register access as root and asks for your password at each launch. `sudo ~/.local/bin/rochcpu setup` once stops it asking (see [Linux notes](docs/linux.md#no-password-at-each-launch)).
 3. `sudo rochcpu --probe` runs the diagnostics directly.
 
 Needs polkit, and kernel lockdown off (it is usually tied to Secure Boot): lockdown refuses MSR and port access to every program. See [Linux notes](docs/linux.md).
+
+## What's new in 1.0.9
+
+- **Linux: no password at each launch.** `sudo rochcpu setup` installs a root-owned copy at `/usr/local/bin/rochcpu` and a polkit rule that lets you, and only you, start exactly that copy as the helper from your own desktop session. `rochcpu setup --status` says whether it is in place, and `sudo rochcpu setup --undo` removes it.
+- **`--core-offset-probe`** retries putting the original offset back while the CPU answers busy, and says so plainly if it still cannot.
 
 ## What's new in 1.0.8
 
