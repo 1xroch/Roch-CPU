@@ -986,7 +986,7 @@ impl MainWindow {
         }
         if let Some(intel) = self.model.intel() {
             let mut d = PerCoreDialog::new(self.model.clone(), intel);
-            d.position = centre(super::per_core::SIZE);
+            d.position = centre(d.size());
             self.per_core = Some(d);
         }
     }

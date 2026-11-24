@@ -121,11 +121,19 @@ impl PerCoreDialog {
         }
     }
 
+    /// Tall enough for every row: Arrow Lake has four E-core clusters where Raptor Lake had two,
+    /// and at the fixed 500 px the status line ran over the last of them.
+    pub fn size(&self) -> egui::Vec2 {
+        let e = if self.clusters.is_empty() { 0.0 } else { 30.0 + self.clusters.len() as f32 * ROW };
+        let needed = 14.0 + 44.0 + 12.0 + 20.0 + self.cores.len() as f32 * ROW + e + 12.0 + 38.0 + 30.0 + 14.0;
+        egui::vec2(SIZE.x, needed.max(SIZE.y))
+    }
+
     /// Shows the dialog; returns false once it has been closed.
     pub fn show(&mut self, ctx: &egui::Context, icon: &Arc<IconData>) -> bool {
         let mut builder = ViewportBuilder::default()
             .with_title("Per-core ratio")
-            .with_inner_size(SIZE)
+            .with_inner_size(self.size())
             .with_resizable(false)
             .with_minimize_button(false)
             .with_maximize_button(false)
