@@ -38,7 +38,7 @@ fn native_options(icon: Arc<IconData>) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
-            .with_app_id("Roch CPU")
+            .with_app_id("RochCPU")
             .with_decorations(false)
             .with_resizable(true)
             .with_inner_size([500.0, 760.0])

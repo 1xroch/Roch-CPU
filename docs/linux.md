@@ -4,9 +4,9 @@ The same window, rows and safety rules as on Windows, on Wayland or X11. There i
 
 ## How it reaches the hardware
 
-The window runs as your user. Register access needs root, and a Wayland client should not run as root: the compositor socket, settings and fonts belong to the person at the desk. So at launch Roch CPU starts itself a second time through `pkexec` (`roch-cpu --hardware-helper`), and the two talk over a pipe, one register call per message. Closing the window closes the pipe, and the helper exits. Roch Viewer uses the same design.
+The window runs as your user. Register access needs root, and a Wayland client should not run as root: the compositor socket, settings and fonts belong to the person at the desk. So at launch Roch CPU starts itself a second time through `pkexec` (`rochcpu --hardware-helper`), and the two talk over a pipe, one register call per message. Closing the window closes the pipe, and the helper exits. Roch Viewer uses the same design.
 
-Run as root (`sudo roch-cpu --probe`), Roch CPU uses the interfaces directly and no helper starts. `ROCHCPU_NO_HELPER=1` stops it asking at all, and `ROCHCPU_LOG=1` mirrors the Log window to stderr.
+Install with `packaging/linux/install.sh` (the binary as `~/.local/bin/rochcpu`, a launcher entry and its icon), or run `target/release/roch-cpu` from the build directly. Run as root (`sudo rochcpu --probe`), Roch CPU uses the interfaces directly and no helper starts. `ROCHCPU_NO_HELPER=1` stops it asking at all, and `ROCHCPU_LOG=1` mirrors the Log window to stderr.
 
 | Windows (WinRing0) | Linux |
 | --- | --- |
@@ -65,7 +65,7 @@ What changed for Arrow Lake:
 
 ### Write test
 
-`sudo roch-cpu --write-test` (or the same through `pkexec`) writes every Intel row a small step, measures the effect with something other than the register it wrote, and then writes back a raw snapshot of every register it could have touched and reads it all again. On the 270K Plus above, Linux, 2026-11-23:
+`sudo rochcpu --write-test` (or the same through `pkexec`) writes every Intel row a small step, measures the effect with something other than the register it wrote, and then writes back a raw snapshot of every register it could have touched and reads it all again. On the 270K Plus above, Linux, 2026-11-23:
 
 | Row | Change | Measured | Result |
 | --- | --- | --- | --- |

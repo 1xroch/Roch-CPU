@@ -130,7 +130,7 @@ pub fn run_confirm_dialog(args: &[String]) -> i32 {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&caption)
-            .with_app_id("Roch CPU")
+            .with_app_id("RochCPU")
             .with_inner_size([440.0, 200.0])
             .with_resizable(false)
             .with_icon(super::app_icon()),

@@ -89,6 +89,22 @@ included here. Neither encoding came from the observation: reading the base-cloc
 trace gives the wrong answer entirely, and both it and the VDD2 scale were established by
 measuring the board's response, as `BclkController` and `Vdd2Rail` document.
 
+## Linux register access and board maps
+
+The Linux transport (an unprivileged window with a `pkexec` helper over a pipe, the helper's
+refusals, and the `flock` files that stand in for the Windows named mutexes) follows the design of
+[Roch Viewer](https://github.com/RochStudio/Roch-Viewer), the same author's project, and uses the
+same lock-file names so the tools serialise against each other. The Z890 AORUS TACHYON ICE's ITE
+IT8696E input map (Vcore, VNNAON, VCCSA) is Roch Viewer's confirmed map.
+
+The board regulator map (Renesas PMBus controllers at 0x60/0x62) and the Arrow Lake mailbox
+domains were read off the hardware with this program's own read-only scans; the PMBus command
+codes are the PMBus specification's. The Arrow Lake D2D/NGU defaults cited in `docs/linux.md` are
+from SkatterBencher's published overclocking guides; no code was taken from them.
+
+The [libc](https://crates.io/crates/libc) crate (MIT or Apache-2.0) provides the Linux system
+calls.
+
 ## The Roch mark
 
 The `assets/` artwork is shared with [Roch GPU](https://github.com/RochStudio/Roch-GPU) and

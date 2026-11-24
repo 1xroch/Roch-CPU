@@ -48,7 +48,7 @@ BEGIN
       VALUE "FileVersion", "{major}.{minor}.{patch}.0"
       VALUE "ProductName", "Roch CPU"
       VALUE "ProductVersion", "{product_version}"
-      VALUE "LegalCopyright", "Roch Studio - open CPU tuning for LGA1700 and AMD Ryzen"
+      VALUE "LegalCopyright", "Roch Studio - open CPU tuning for Intel LGA1700/LGA1851 and AMD Ryzen"
       VALUE "OriginalFilename", "Roch CPU.exe"
     END
   END

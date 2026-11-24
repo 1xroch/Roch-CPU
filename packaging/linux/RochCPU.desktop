@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Roch CPU
+GenericName=CPU tuning
+Comment=CPU and DDR5 tuning: ratios, voltages, power limits
+Exec=rochcpu
+Icon=RochCPU
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupWMClass=RochCPU

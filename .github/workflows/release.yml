@@ -20,7 +20,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ inputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Desktop build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libgl1-mesa-dev
+
+      - name: Regression checks
+        run: cargo test --release --locked
+
+      - name: Build and package
+        run: |
+          version="${RELEASE_TAG#v}"
+          cargo build --release --locked
+          grep -q "^version = \"$version\"" Cargo.toml || { echo "Cargo.toml is not $version"; exit 1; }
+          dir="Roch-CPU-$version-linux-x86_64"
+          mkdir -p "$dir"
+          install -m755 target/release/roch-cpu "$dir/rochcpu"
+          strip "$dir/rochcpu"
+          install -m755 packaging/linux/install.sh "$dir/install.sh"
+          install -m644 packaging/linux/RochCPU.desktop "$dir/RochCPU.desktop"
+          install -m644 assets/mark.png "$dir/RochCPU.png"
+          cp LICENSE THIRD-PARTY-NOTICES.md "$dir/"
+          cp -r docs "$dir/docs"
+          tar -czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > linux.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-package
+          path: |
+            Roch-CPU-*-linux-x86_64.tar.gz
+            linux.sha256
+
   publish:
+    needs: linux
     runs-on: windows-latest
     env:
       RELEASE_TAG: ${{ inputs.tag }}
@@ -50,6 +95,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
           Move-Item -LiteralPath dist -Destination package
 
+      - uses: actions/download-artifact@v7
+        with:
+          name: linux-package
+          path: linux-package
+
       - name: Package and verify
         shell: pwsh
         run: |
@@ -66,7 +116,13 @@ jobs:
           $zipName = "Roch-CPU-$version-win-x64.zip"
           Compress-Archive -LiteralPath $files.FullName -DestinationPath $zipName -CompressionLevel Optimal
           $hash = (Get-FileHash -LiteralPath $zipName).Hash.ToLowerInvariant()
-          "$hash  $zipName" | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
+          $linux = Get-ChildItem -LiteralPath linux-package -Filter 'Roch-CPU-*-linux-x86_64.tar.gz'
+          if (!$linux) { throw 'Linux package missing' }
+          Copy-Item -LiteralPath $linux.FullName -Destination .
+          $linuxHash = (Get-FileHash -LiteralPath $linux.Name).Hash.ToLowerInvariant()
+          $built = (Get-Content -LiteralPath linux-package/linux.sha256).Split(' ')[0]
+          if ($built -ne $linuxHash) { throw 'Linux package hash changed in transit' }
+          "$hash  $zipName", "$linuxHash  $($linux.Name)" | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
 
       - name: Upload, verify and publish existing draft
         shell: pwsh
@@ -77,11 +133,12 @@ jobs:
           $release = $releases | Where-Object tag_name -EQ $env:RELEASE_TAG
           if (!$release -or !$release.draft -or $release.target_commitish -ne $env:SOURCE_SHA) { throw 'Expected matching draft release' }
           $zipName = "Roch-CPU-$($env:RELEASE_TAG.Substring(1))-win-x64.zip"
-          gh release upload $env:RELEASE_TAG $zipName SHA256SUMS.txt --clobber
+          $linuxName = "Roch-CPU-$($env:RELEASE_TAG.Substring(1))-linux-x86_64.tar.gz"
+          gh release upload $env:RELEASE_TAG $zipName $linuxName SHA256SUMS.txt --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Upload failed; release remains a draft' }
           $assets = gh api "$api/releases/$($release.id)/assets" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Could not verify uploaded assets' }
-          foreach ($name in @($zipName, 'SHA256SUMS.txt')) {
+          foreach ($name in @($zipName, $linuxName, 'SHA256SUMS.txt')) {
             $asset = $assets | Where-Object name -EQ $name
             $expected = 'sha256:' + (Get-FileHash -LiteralPath $name).Hash.ToLowerInvariant()
             if (!$asset -or $asset.state -ne 'uploaded' -or $asset.digest -ne $expected -or $asset.size -ne (Get-Item -LiteralPath $name).Length) { throw "Asset verification failed: $name" }

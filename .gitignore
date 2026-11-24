@@ -13,6 +13,9 @@ smbus.txt
 vtest.txt
 smu.txt
 apply.txt
+write-test.txt
+mailbox-scan.txt
+intel-audit.txt
 pmtable.txt
 *.bin
 !drivers/pawnio/RyzenSMU.bin
