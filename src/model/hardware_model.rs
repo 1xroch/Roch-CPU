@@ -1052,8 +1052,8 @@ impl HardwareModel {
         }
         let locked = self.power_limits_locked();
         for (id, name, which, note) in [
-            ("pl1", "Package Power Limit 1 (PL1)", 1, "Long duration package power limit (MSR 0x610)."),
-            ("pl2", "Package Power Limit 2 (PL2)", 2, "Short duration package power limit (MSR 0x610)."),
+            ("pl1", "Power Limit 1 (PL1)", 1, "Long duration package power limit (MSR 0x610)."),
+            ("pl2", "Power Limit 2 (PL2)", 2, "Short duration package power limit (MSR 0x610)."),
         ] {
             let mut s = Setting::new(id, name, SettingGroup::Power);
             s.unit = "W".into();
@@ -1423,8 +1423,8 @@ impl HardwareModel {
         let Some(vr) = self.board_vr.get().cloned() else { return };
         for (id, name, rail, what) in [
             ("vr_vcore", "Vcore (board VR)", VrRail::Vcore, "the CPU cores and ring (VccIA)"),
-            ("vr_vccsa", "VCCSA (NGU, IMC)", VrRail::VccSa, "the SoC tile: memory controller and NGU fabric"),
-            ("vr_vnnaon", "VNNAON (D2D)", VrRail::VnnAon, "the always-on SoC rail, which also feeds the D2D link"),
+            ("vr_vccsa", "VCCSA", VrRail::VccSa, "the SoC tile: memory controller and NGU fabric"),
+            ("vr_vnnaon", "VNNAON", VrRail::VnnAon, "the always-on SoC rail, which also feeds the D2D link"),
         ] {
             let Ok(page) = vr.read(rail) else { continue };
             let (lo, hi) = rail.range();
