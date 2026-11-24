@@ -2,7 +2,7 @@
 name = "roch-cpu"
 version = "1.0.7"
 edition = "2024"
-description = "Roch CPU - open CPU tuning for LGA1700 and AMD Ryzen"
+description = "Roch CPU - open CPU tuning for Intel LGA1700 and LGA1851 and AMD Ryzen, on Windows and Linux"
 authors = ["Roch Studio"]
 license-file = "LICENSE"
 publish = false
@@ -15,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
+
+[target.'cfg(windows)'.dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "persistence"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
@@ -42,6 +44,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "persistence", "wayland", "x11"] }
+libc = "0.2"
 
 [build-dependencies]
 embed-resource = "3"

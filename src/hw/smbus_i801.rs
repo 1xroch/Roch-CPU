@@ -1,23 +1,50 @@
 //! Intel PCH SMBus host controller (the i801 family: bus 0, device 31, function 4)
 //! driven through I/O ports. Used to reach the DDR5 SPD hubs and PMICs on the DIMMs.
+// Linux drives the SMBus through the kernel adapter (smbus_kernel); this raw path is Windows.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CreateMutexExW, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
 
-use super::native::{self, OwnedHandle, lock, wide};
+#[cfg(windows)]
+use super::native::{OwnedHandle, wide};
+use super::native::{self, lock};
 use super::{KernelDriver, Smbus};
 
 /// The named mutex HWiNFO, LibreHardwareMonitor and ZenStates take around SMBus transactions
 /// (the .NET build's `new Mutex(false, @"Global\Access_SMBUS.HTP.Method")`).
+#[cfg(windows)]
 pub(crate) struct SmbusGlobalMutex(OwnedHandle);
 
+/// The same name on Linux, as a lock file Roch Viewer also takes.
+#[cfg(not(windows))]
+pub(crate) struct SmbusGlobalMutex(native::NamedMutex);
+
+#[cfg(not(windows))]
+impl SmbusGlobalMutex {
+    pub(crate) fn create() -> Option<SmbusGlobalMutex> {
+        native::NamedMutex::create(Some(r"Global\Access_SMBUS.HTP.Method")).ok().map(SmbusGlobalMutex)
+    }
+
+    pub(crate) fn wait(&self, timeout_ms: u32) -> bool {
+        self.0.wait(timeout_ms)
+    }
+
+    pub(crate) fn release(&self) {
+        let _ = self.0.release();
+    }
+}
+
+#[cfg(windows)]
 impl SmbusGlobalMutex {
     pub(crate) const NAME: &'static str = r"Global\Access_SMBUS.HTP.Method";
 
@@ -52,13 +79,18 @@ impl SmbusGlobalMutex {
 /// driven through I/O ports. Used to reach the DDR5 SPD hubs and PMICs on the DIMMs.
 pub struct SmbusI801 {
     drv: Arc<dyn KernelDriver>,
+    /// The PCH's PCI bus: 0 on LGA1700, 0x80 on LGA1851 (Z890 and the other 800-series chipsets
+    /// sit behind the SoC's own bus 0).
+    bus: u8,
     base: u16,
     pci_id: u32,
     global_mutex: Option<SmbusGlobalMutex>,
     lock: Mutex<()>,
 }
 
-const BUS: u8 = 0;
+/// Where the PCH SMBus controller is looked for first: bus 0 (600/700-series, LGA1700), then
+/// bus 0x80 (800-series, LGA1851), then every other bus.
+const PREFERRED_BUSES: [u8; 2] = [0, 0x80];
 const DEVICE: u8 = 31;
 const FUNCTION: u8 = 4;
 
@@ -105,32 +137,42 @@ impl SmbusI801 {
         self.pci_id
     }
 
-    fn new(drv: Arc<dyn KernelDriver>, base_addr: u16, pci_id: u32) -> SmbusI801 {
-        SmbusI801 { drv, base: base_addr, pci_id, global_mutex: SmbusGlobalMutex::create(), lock: Mutex::new(()) }
+    fn new(drv: Arc<dyn KernelDriver>, bus: u8, base_addr: u16, pci_id: u32) -> SmbusI801 {
+        SmbusI801 { drv, bus, base: base_addr, pci_id, global_mutex: SmbusGlobalMutex::create(), lock: Mutex::new(()) }
+    }
+
+    /// The bus whose device 31 function 4 is an Intel SMBus controller (class 0C05), and its ID.
+    fn locate(drv: &Arc<dyn KernelDriver>) -> Option<(u8, u32)> {
+        let is_smbus = |bus: u8| -> Option<u32> {
+            let id = drv.read_pci_config(bus, DEVICE, FUNCTION, 0).filter(|id| id & 0xFFFF == 0x8086)?;
+            let class = drv.read_pci_config(bus, DEVICE, FUNCTION, 0x08)? >> 16;
+            (class == 0x0C05).then_some(id)
+        };
+        PREFERRED_BUSES
+            .into_iter()
+            .chain((1..=0xFFu8).filter(|b| !PREFERRED_BUSES.contains(b)))
+            .find_map(|bus| is_smbus(bus).map(|id| (bus, id)))
     }
 
     /// Returns `None` if the PCH SMBus controller is absent, hidden by the BIOS, or has no I/O window.
     pub fn try_create(drv: Arc<dyn KernelDriver>) -> (Option<SmbusI801>, String) {
-        let id = match drv.read_pci_config(BUS, DEVICE, FUNCTION, 0) {
-            Some(id) if (id & 0xFFFF) == 0x8086 => id,
-            _ => {
-                return (
-                    None,
-                    "PCH SMBus controller (B0:D31:F4) not visible - hidden by BIOS or unsupported chipset.".to_string(),
-                );
-            }
+        let Some((bus, id)) = Self::locate(&drv) else {
+            return (
+                None,
+                "PCH SMBus controller (D31:F4) not visible - hidden by BIOS or unsupported chipset.".to_string(),
+            );
         };
-        let bar = drv.read_pci_config(BUS, DEVICE, FUNCTION, 0x20).unwrap_or(0);
+        let bar = drv.read_pci_config(bus, DEVICE, FUNCTION, 0x20).unwrap_or(0);
         let base_addr = (bar & 0xFFFE) as u16;
         if (bar & 1) == 0 || base_addr == 0 || base_addr == 0xFFFE {
             return (None, "PCH SMBus controller has no I/O base (SMB_BASE).".to_string());
         }
-        let hstcfg = drv.read_pci_config(BUS, DEVICE, FUNCTION, 0x40).unwrap_or(0);
+        let hstcfg = drv.read_pci_config(bus, DEVICE, FUNCTION, 0x40).unwrap_or(0);
         if (hstcfg & 1) == 0 {
             return (None, "PCH SMBus host interface is disabled (HST_EN=0).".to_string());
         }
-        let status = format!("PCH SMBus 0x{:04X} at I/O 0x{:04X}", id >> 16, base_addr);
-        (Some(SmbusI801::new(drv, base_addr, id)), status)
+        let status = format!("PCH SMBus 0x{:04X} (bus 0x{bus:02X}) at I/O 0x{:04X}", id >> 16, base_addr);
+        (Some(SmbusI801::new(drv, bus, base_addr, id)), status)
     }
 
     fn inp(&self, off: u16) -> Result<u8> {
@@ -319,18 +361,18 @@ impl SmbusI801 {
     /// or never-completed address phase leaves behind.
     pub fn hard_reset(&self) -> Result<String> {
         let _g = lock(&self.lock);
-        let Some(cfg) = self.drv.read_pci_config(BUS, DEVICE, FUNCTION, 0x40) else {
+        let Some(cfg) = self.drv.read_pci_config(self.bus, DEVICE, FUNCTION, 0x40) else {
             return Ok("could not read HSTCFG".to_string());
         };
         let before = cfg;
-        self.drv.write_pci_config(BUS, DEVICE, FUNCTION, 0x40, cfg | 0x08); // SSRESET
+        self.drv.write_pci_config(self.bus, DEVICE, FUNCTION, 0x40, cfg | 0x08); // SSRESET
         native::sleep_ms(10);
-        self.drv.write_pci_config(BUS, DEVICE, FUNCTION, 0x40, cfg & !0x08u32); // release, HST_EN preserved
+        self.drv.write_pci_config(self.bus, DEVICE, FUNCTION, 0x40, cfg & !0x08u32); // release, HST_EN preserved
         native::sleep_ms(10);
         self.out(HST_STS, STS_ALL_FLAGS | STS_BYTE_DONE)?;
         self.out(HST_STS, STS_INUSE)?;
         native::sleep_ms(10);
-        let after = self.drv.read_pci_config(BUS, DEVICE, FUNCTION, 0x40).unwrap_or(0);
+        let after = self.drv.read_pci_config(self.bus, DEVICE, FUNCTION, 0x40).unwrap_or(0);
         let sts = self.inp(HST_STS)?;
         Ok(format!("HSTCFG 0x{before:02X} -> 0x{after:02X}, HST_STS now 0x{sts:02X}"))
     }

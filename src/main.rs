@@ -25,6 +25,17 @@ fn run() -> i32 {
         return ui::run_preview(&args[1..]);
     }
 
+    // Linux: this executable is also the root register helper and the Yes/No prompt.
+    #[cfg(target_os = "linux")]
+    {
+        if args.first().is_some_and(|a| a == hw::linux::HELPER_ARG) {
+            return hw::linux::helper::serve();
+        }
+        if args.first().is_some_and(|a| a == ui::CONFIRM_ARG) {
+            return ui::run_confirm_dialog(&args[1..]);
+        }
+    }
+
     // The diagnostic switches print to the console they were launched from; a windows-subsystem
     // executable has none of its own.
     if !args.is_empty() {
@@ -33,6 +44,10 @@ fn run() -> i32 {
     }
 
     let model = Arc::new(HardwareModel::new());
+    // ROCHCPU_LOG=1 mirrors the Log window to stderr, for a terminal or a bug report.
+    if std::env::var_os("ROCHCPU_LOG").is_some() {
+        model.on_log(|m| eprintln!("{m}"));
+    }
     // A panic on the UI thread must still drop the model, so the driver service is removed.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ui::run(model.clone() as Arc<dyn ui::model::UiModel>)));
     match result {
@@ -59,8 +74,21 @@ fn run() -> i32 {
 }
 
 /// A modal error box (the .NET `MessageBox.Show` with the error icon).
+#[cfg(windows)]
 fn show_error(title: &str, text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     let (t, m) = (hw::native::wide(title), hw::native::wide(text));
     unsafe { MessageBoxW(std::ptr::null_mut(), m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONERROR) };
+}
+
+/// Linux has no system error box: stderr, and a desktop notification where one can be sent.
+#[cfg(not(windows))]
+fn show_error(title: &str, text: &str) {
+    eprintln!("{title}: {text}");
+    let _ = std::process::Command::new("notify-send")
+        .args(["--urgency=critical", title, text])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }

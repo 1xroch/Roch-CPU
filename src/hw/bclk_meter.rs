@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
@@ -36,11 +38,43 @@ fn rdtsc() -> u64 {
 
 /// Raises the calling thread to `THREAD_PRIORITY_HIGHEST` (the .NET `ThreadPriority.Highest`)
 /// and puts the previous priority back when dropped.
+#[cfg(windows)]
 struct HighestPriority {
     thread: HANDLE,
     old: i32,
 }
 
+/// The nearest Linux has without a real-time class: the thread's nice value raised as far as
+/// it may go (root can; a user process keeps what it has), put back when dropped.
+#[cfg(target_os = "linux")]
+struct HighestPriority {
+    old: Option<i32>,
+}
+
+#[cfg(target_os = "linux")]
+impl HighestPriority {
+    fn enter() -> HighestPriority {
+        // SAFETY: plain libc calls on the calling thread (who = 0).
+        unsafe {
+            *libc::__errno_location() = 0;
+            let old = libc::getpriority(libc::PRIO_PROCESS, 0);
+            let ok = *libc::__errno_location() == 0 && libc::setpriority(libc::PRIO_PROCESS, 0, -20) == 0;
+            HighestPriority { old: ok.then_some(old) }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HighestPriority {
+    fn drop(&mut self) {
+        if let Some(old) = self.old {
+            // SAFETY: as above.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, old) };
+        }
+    }
+}
+
+#[cfg(windows)]
 impl HighestPriority {
     fn enter() -> HighestPriority {
         // SAFETY: GetCurrentThread returns a pseudo-handle valid for the calling thread.
@@ -51,6 +85,7 @@ impl HighestPriority {
     }
 }
 
+#[cfg(windows)]
 impl Drop for HighestPriority {
     fn drop(&mut self) {
         // SAFETY: same thread, same pseudo-handle.
@@ -82,7 +117,7 @@ impl BclkMeter {
     pub const CYCLES_SAMPLE_MS: i32 = 150;
 
     pub fn new(drv: Arc<dyn KernelDriver>) -> BclkMeter {
-        let (pm_timer_port, timer_32bit, status) = Self::locate_pm_timer();
+        let (pm_timer_port, timer_32bit, status) = Self::locate_pm_timer(drv.as_ref());
         BclkMeter { drv, pm_timer_port, timer_32bit, status }
     }
 
@@ -94,8 +129,8 @@ impl BclkMeter {
         &self.status
     }
 
-    fn locate_pm_timer() -> (u16, bool, String) {
-        let fadt = FirmwareTables::get(FirmwareTables::ACPI, FirmwareTables::signature("FACP"));
+    fn locate_pm_timer(drv: &dyn KernelDriver) -> (u16, bool, String) {
+        let fadt = FirmwareTables::get_with(drv, FirmwareTables::ACPI, FirmwareTables::signature("FACP"));
         parse_fadt(fadt.as_deref())
     }
 
@@ -219,6 +254,9 @@ impl BclkMeter {
     pub fn measure_bclk_from_cycles(&self, cpu_index: i32, sample_ms: i32) -> Result<Option<f64>> {
         if !self.is_available() {
             return Ok(None);
+        }
+        if let Some(remote) = self.drv.measure_bclk_from_cycles(cpu_index, sample_ms) {
+            return remote;
         }
         let mask: u32 = if self.timer_32bit { 0xFFFFFFFF } else { 0xFFFFFF };
         let target_ticks = (PM_TIMER_HZ * sample_ms as f64 / 1000.0) as u32;

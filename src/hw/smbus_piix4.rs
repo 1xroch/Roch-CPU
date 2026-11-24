@@ -8,6 +8,8 @@
 //! the PM MMIO block. Changing it needs an MMIO write the WinRing0 driver cannot do, so this
 //! type talks to whichever port the BIOS left selected; the DIMMs are on it on the boards
 //! tried so far, and if they are not the probe simply finds no SPD hubs and says so.
+// Linux drives the SMBus through the kernel adapter (smbus_kernel); this raw path is Windows.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};

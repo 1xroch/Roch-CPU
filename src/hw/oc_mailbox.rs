@@ -303,10 +303,11 @@ impl OcMailbox {
         }
     }
 
-    /// IccMax for a domain in amperes (mailbox 0x16, 1/4 A units).
+    /// IccMax for a domain in amperes (mailbox 0x16, bits 10:0 in 1/4 A units). Ten bits top out
+    /// at 255.75 A: a Core Ultra 7 270K Plus reports 0x56C, 347 A, which ten bits read as 91 A.
     pub fn read_icc_max(&self, domain: i32) -> Option<f64> {
         match self.execute(Self::CMD_READ_ICCMAX, domain as u8, 0, 0) {
-            Ok((0, d)) => Some((d & 0x3FF) as f64 / 4.0),
+            Ok((0, d)) => Some((d & 0x7FF) as f64 / 4.0),
             _ => None,
         }
     }

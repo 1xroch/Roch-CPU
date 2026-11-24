@@ -4,21 +4,29 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CreateMutexExW, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
 
 use super::KernelDriver;
-use super::native::{self, OwnedHandle};
+use super::native;
+#[cfg(windows)]
+use super::native::OwnedHandle;
+#[cfg(not(windows))]
+pub use super::native::NamedMutex;
 
 // ---------------------------------------------------------------- named Win32 mutex
 
 /// A Win32 mutex, named (shared with other monitoring tools, e.g. `Global\Access_EC`) or
 /// unnamed. The .NET `System.Threading.Mutex` this replaces: ownership is per thread and
-/// recursive, an abandoned mutex counts as acquired.
+/// recursive, an abandoned mutex counts as acquired. Linux has its own in `native`.
+#[cfg(windows)]
 pub struct NamedMutex(OwnedHandle);
 
+#[cfg(windows)]
 impl NamedMutex {
     /// `new Mutex(false, name)`: creates or opens the mutex without taking ownership. Opens with
     /// the rights .NET requests (MAXIMUM_ALLOWED | SYNCHRONIZE | MUTEX_MODIFY_STATE), so a mutex
@@ -176,6 +184,20 @@ impl SuperIo {
     /// naming a rail would be a guess, so only Vcore is used.
     pub fn named_rails(&self) -> &[(&'static str, i32)] {
         &self.named_rails
+    }
+
+    /// Names the rails of a board whose ITE wiring has been confirmed against its BIOS readings.
+    /// Gigabyte Z890 AORUS TACHYON ICE: Roch Viewer's map for the IT8696E at 0x2E (VIN0 Vcore,
+    /// VIN5 CPU VNNAON, VIN6 VCCSA), 12 mV per step with no divider.
+    pub fn with_board_rails(mut self, board_product: &str) -> SuperIo {
+        if self.kind == SuperIoKind::Ite
+            && self.sio_port == 0x2E
+            && self.name == "ITE IT8696"
+            && board_product.trim().eq_ignore_ascii_case("Z890 AORUS TACHYON ICE")
+        {
+            self.named_rails = vec![("CPU Vcore", 0), ("CPU VNNAON", 5), ("VCCSA", 6)];
+        }
+        self
     }
 
     fn new(drv: Arc<dyn KernelDriver>, sio_port: u16, base_addr: u16, kind: SuperIoKind, name: String) -> SuperIo {

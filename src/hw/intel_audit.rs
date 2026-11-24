@@ -10,7 +10,6 @@ use super::intel_cpu::IntelCpu;
 use super::native::{self, lock};
 use super::oc_mailbox::OcMailbox;
 use super::super_io::SuperIo;
-use super::winring0::WinRing0Driver;
 use super::KernelDriver;
 
 /// A report that is rewritten after every line, so a crash mid-test still leaves the evidence.
@@ -63,7 +62,7 @@ fn join(v: &[i32]) -> String {
 }
 
 fn open_driver() -> Result<Arc<dyn KernelDriver>> {
-    Ok(Arc::new(WinRing0Driver::open()?))
+    crate::hw::open_driver()
 }
 
 /// True when another copy of this program is running.

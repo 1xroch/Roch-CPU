@@ -47,7 +47,7 @@ pub struct HeaderInfo {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IntelInfo {
     pub hypervisor_present: bool,
-    pub is_lga1700_family: bool,
+    pub is_known_desktop: bool,
     pub e_core_count: i32,
 }
 

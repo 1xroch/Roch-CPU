@@ -13,7 +13,6 @@ use super::intel_cpu::IntelCpu;
 use super::native;
 use super::oc_mailbox::OcMailbox;
 use super::smbios::SmbiosInfo;
-use super::winring0::WinRing0Driver;
 use super::KernelDriver;
 use crate::model::hardware_model::HardwareModel;
 
@@ -282,7 +281,7 @@ pub fn run(path: &Path, test_bclk: bool) -> i32 {
         if test_bclk {
             require_single_instance()?;
         }
-        let driver: Arc<dyn KernelDriver> = Arc::new(WinRing0Driver::open()?);
+        let driver: Arc<dyn KernelDriver> = crate::hw::open_driver()?;
         let cpu = IntelCpu::new(driver.clone())?;
         let meter = BclkMeter::new(driver.clone());
         let (asus, status) = AsusBoardControl::try_create(&SmbiosInfo::read().board_manufacturer);

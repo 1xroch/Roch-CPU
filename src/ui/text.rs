@@ -187,8 +187,8 @@ pub fn warnings(w: &WarningInputs) -> Vec<&'static str> {
             warns.push("Hypervisor active: read-back values may not reach hardware (see Log)");
         }
     }
-    if w.intel.is_some_and(|i| !i.is_lga1700_family) {
-        warns.push("not a known LGA1700 CPU");
+    if w.intel.is_some_and(|i| !i.is_known_desktop) {
+        warns.push("not a known LGA1700 or LGA1851 CPU");
     }
     if w.amd.is_some_and(|a| !a.is_supported) {
         warns.push("unknown Zen generation: SMU message numbers assumed");
@@ -369,7 +369,7 @@ mod tests {
             oc_locked: false,
             voltage_access_restricted: false,
             mailbox_available: true,
-            intel: Some(IntelInfo { hypervisor_present: false, is_lga1700_family: true, e_core_count: 8 }),
+            intel: Some(IntelInfo { hypervisor_present: false, is_known_desktop: true, e_core_count: 8 }),
             amd: None,
             smu_available: false,
             pbo_allowed: true,
@@ -379,19 +379,19 @@ mod tests {
             driver_loaded: false,
             oc_locked: true,
             mailbox_available: false,
-            intel: Some(IntelInfo { hypervisor_present: true, is_lga1700_family: false, e_core_count: 0 }),
+            intel: Some(IntelInfo { hypervisor_present: true, is_known_desktop: false, e_core_count: 0 }),
             ..base
         });
         assert_eq!(
             join_warnings(&w),
-            "kernel driver not loaded, nothing can be read or written (see Log)  \u{00B7}  BIOS OC Lock set: ratio and voltage writes will be rejected  \u{00B7}  OC mailbox not responding: voltage rows disabled  \u{00B7}  Hypervisor active: read-back values may not reach hardware (see Log)  \u{00B7}  not a known LGA1700 CPU"
+            "kernel driver not loaded, nothing can be read or written (see Log)  \u{00B7}  BIOS OC Lock set: ratio and voltage writes will be rejected  \u{00B7}  OC mailbox not responding: voltage rows disabled  \u{00B7}  Hypervisor active: read-back values may not reach hardware (see Log)  \u{00B7}  not a known LGA1700 or LGA1851 CPU"
         );
         let restricted = WarningInputs {
             driver_loaded: true,
             oc_locked: false,
             voltage_access_restricted: true,
             mailbox_available: false,
-            intel: Some(IntelInfo { hypervisor_present: true, is_lga1700_family: true, e_core_count: 0 }),
+            intel: Some(IntelInfo { hypervisor_present: true, is_known_desktop: true, e_core_count: 0 }),
             amd: None,
             smu_available: false,
             pbo_allowed: true,

@@ -1,5 +1,7 @@
 //! Observes values from existing startup operations only. It never calls a transport or driver.
 //! Collection, formatting and teardown errors are deliberately isolated from hardware control.
+// The ioctl counters are fed by the Windows driver client only.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::cell::RefCell;
 use std::rc::Rc;

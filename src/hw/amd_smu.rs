@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail};
 
 use super::KernelDriver;
-use super::native::{self, OwnedHandle, lock};
+use super::native::{self, lock};
+#[cfg(windows)]
+use super::native::OwnedHandle;
 use super::pawnio::PawnIo;
 
 /// Result code of an SMU mailbox transaction. 0x01..0xFF are the SMU's own; the rest are ours.
@@ -481,8 +483,29 @@ impl PmTableLayout {
 }
 
 /// `Global\Access_PCI`, the named mutex other Ryzen tools take around SMN accesses.
+#[cfg(windows)]
 struct PciMutex(OwnedHandle);
 
+/// The same name on Linux, as a lock file Roch Viewer also takes.
+#[cfg(not(windows))]
+struct PciMutex(native::NamedMutex);
+
+#[cfg(not(windows))]
+impl PciMutex {
+    fn open() -> Option<Self> {
+        native::NamedMutex::create(Some(r"Global\Access_PCI")).ok().map(Self)
+    }
+
+    fn wait(&self, ms: u32) -> bool {
+        self.0.wait(ms)
+    }
+
+    fn release(&self) {
+        let _ = self.0.release();
+    }
+}
+
+#[cfg(windows)]
 impl PciMutex {
     const NAME: &'static str = r"Global\Access_PCI";
 
@@ -1110,6 +1133,9 @@ impl AmdSmu {
     /// The bundled WinRing0 cannot: its physical-memory read is limited to the BIOS ROM window.
     /// `Ok(status)` when attached, `Err(status)` with the reason when not.
     pub fn try_attach_pawn_io(&self, module_path: &Path) -> std::result::Result<String, String> {
+        if cfg!(not(windows)) {
+            return Err("The SMU power table has no Linux reader yet, so PPT/TDC/EDC have no read-back".into());
+        }
         if !PawnIo::is_installed() {
             return Err("PawnIO is not installed (https://pawnio.eu), so the SMU power table cannot be read and PPT/TDC/EDC have no read-back".into());
         }

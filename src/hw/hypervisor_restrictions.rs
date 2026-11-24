@@ -1,4 +1,6 @@
 //! Reads Windows' own restricted-MSR events. Never changes virtualization settings.
+// The Hyper-V event log is Windows-only; elsewhere only the types and decision remain.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
 
@@ -18,6 +20,14 @@ const EVENT_NS: &str = "http://schemas.microsoft.com/win/2004/08/events/event";
 
 /// Restricted-MSR events (EventID 12550) recorded since this boot, newest first, plus a status
 /// line (the C# `out string status`). Events read before a log error are still returned.
+#[cfg(not(windows))]
+pub fn read_current_boot() -> (Vec<RestrictedMsrAccess>, String) {
+    // The Hyper-V restricted-MSR log is a Windows thing. Under a Linux hypervisor (a guest), the
+    // MSR interface itself says what is virtualised by failing.
+    (Vec::new(), "Running under a hypervisor: register readback may be virtualised.".to_string())
+}
+
+#[cfg(windows)]
 pub fn read_current_boot() -> (Vec<RestrictedMsrAccess>, String) {
     let mut found = Vec::new();
     // DateTime.UtcNow - Environment.TickCount64
@@ -133,6 +143,7 @@ fn parse_uint(s: &str, hex: bool) -> Option<u32> {
 }
 
 /// The Windows event-log query (wevtapi), kept apart so `parse` stays a pure function.
+#[cfg(windows)]
 mod event_log {
     use chrono::{DateTime, Utc};
     use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS};

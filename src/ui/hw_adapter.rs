@@ -106,7 +106,7 @@ impl UiModel for HardwareModel {
     fn intel(&self) -> Option<IntelInfo> {
         self.cpu().map(|c| IntelInfo {
             hypervisor_present: c.hypervisor_present(),
-            is_lga1700_family: c.is_lga1700_family(),
+            is_known_desktop: c.is_known_desktop(),
             e_core_count: c.e_core_count() as i32,
         })
     }

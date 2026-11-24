@@ -149,9 +149,38 @@ pub fn glyph(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("glyph".into()))
 }
 
+#[cfg(windows)]
 fn system_font(file: &str) -> Option<Vec<u8>> {
     let dir = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     std::fs::read(dir.join("Fonts").join(file)).ok()
+}
+
+/// The same faces on Linux, by fontconfig: Consolas where someone installed it, otherwise the
+/// desktop's monospace face (and its bold), and a symbol face for the glyphs.
+#[cfg(not(windows))]
+fn system_font(file: &str) -> Option<Vec<u8>> {
+    let patterns: &[&str] = match file {
+        "consola.ttf" => &["Consolas", "monospace"],
+        "consolab.ttf" => &["Consolas:bold", "monospace:bold"],
+        "seguisym.ttf" => &["Noto Sans Symbols 2", "DejaVu Sans"],
+        _ => &[],
+    };
+    for pattern in patterns {
+        let out = std::process::Command::new("fc-match").args(["--format", "%{file}", pattern]).output().ok()?;
+        let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let family = pattern.split(':').next().unwrap_or_default();
+        // fc-match always answers; Consolas only counts when it really is Consolas.
+        if family == "Consolas" && !path.to_string_lossy().to_lowercase().contains("consola") {
+            continue;
+        }
+        let loadable = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"));
+        if loadable {
+            if let Ok(bytes) = std::fs::read(&path) {
+                return Some(bytes);
+            }
+        }
+    }
+    None
 }
 
 /// Consolas (regular and bold) and Segoe UI Symbol from the Windows font folder, each falling

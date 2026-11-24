@@ -120,13 +120,21 @@ fn p_core_count(cpu: &IntelCpu) -> usize {
 
 pub fn run(args: &[String]) -> i32 {
     let a0 = args[0].as_str();
+    // Reports go beside the program on Windows (the release is a portable folder); on Linux the
+    // program usually sits somewhere read-only, so they go to the current directory.
+    #[cfg(windows)]
     let dir = app_dir();
+    #[cfg(not(windows))]
+    let dir = std::env::current_dir().unwrap_or_else(|_| app_dir());
 
     if matches!(a0, "--help" | "-h" | "/?") {
         return help();
     }
     if eq(a0, "--probe") {
         return probe(&arg_or(args, 1, dir.join("probe.txt")));
+    }
+    if eq(a0, "--mailbox-scan") {
+        return mailbox_scan(&arg_or(args, 1, dir.join("mailbox-scan.txt")));
     }
     if eq(a0, "--intel-audit") {
         return intel_audit::run(&arg_or(args, 1, dir.join("intel-audit.txt")));
@@ -1160,15 +1168,142 @@ fn trim_3_10(v: f32) -> String {
     format!("{:>10}", if s == "-0" { "0" } else { s })
 }
 
+/// Raw OC mailbox and ratio-MSR readings for mapping a new CPU generation: every domain's VF
+/// word and IccMax, the per-core ratio ceiling on every logical CPU, and the turbo, ring and power
+/// MSRs. Only read commands (0x10, 0x16, 0x18, 0x1C) are sent; nothing is changed.
+fn mailbox_scan(report_path: &Path) -> i32 {
+    let mut text = String::new();
+    let mut w = |s: String| {
+        out!("{s}");
+        text.push_str(&s);
+        text.push('\n');
+    };
+    let driver = match crate::hw::open_driver() {
+        Ok(d) => d,
+        Err(e) => {
+            out!("Driver: {e}");
+            return 1;
+        }
+    };
+    let cpu = match IntelCpu::new(driver.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            out!("CPU: {e}");
+            return 1;
+        }
+    };
+    w(format!("Roch CPU {} mailbox scan {}", crate::APP_VERSION, chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+    w(format!("Driver   : {}", crate::hw::driver_status(driver.as_ref())));
+    w(format!(
+        "CPU      : {} family {:X}h model 0x{:02X} stepping {} - {} ({}), microcode 0x{:X}",
+        cpu.brand_string(),
+        cpu.family(),
+        cpu.model(),
+        cpu.stepping(),
+        cpu.generation(),
+        cpu.platform().socket(),
+        cpu.microcode_revision()
+    ));
+    let sm = crate::hw::smbios::SmbiosInfo::read();
+    w(format!("Board    : {} / BIOS {} {}", sm.mainboard_model(), sm.bios_version, sm.bios_date));
+    w(format!("Topology : {}P + {}E, {} logical", cpu.p_core_count(), cpu.e_core_count(), cpu.logical_cpus().len()));
+    for c in cpu.logical_cpus() {
+        w(format!("  cpu {:>2}: apic 0x{:02X} core {:>3} {}", c.index, c.apic_id, c.core_id, if c.is_p_core { "P" } else { "E" }));
+    }
+    w(format!("E clusters: {:?}", cpu.e_core_clusters()));
+    let p = cpu.first_p_thread();
+    let msr = |index: u32, on: i32| driver.read_msr(index, on).map_or_else(|| "--".to_string(), |v| format!("0x{v:016X}"));
+    w(String::new());
+    w(format!("Package MSRs (read on cpu {p}):"));
+    for (index, name) in [
+        (0xCEu32, "PLATFORM_INFO"),
+        (0x194, "FLEX_RATIO"),
+        (0x1A2, "TEMPERATURE_TARGET"),
+        (0x1AD, "TURBO_RATIO_LIMIT"),
+        (0x1AE, "TURBO_RATIO_LIMIT_CORES"),
+        (0x606, "RAPL_POWER_UNIT"),
+        (0x610, "PKG_POWER_LIMIT"),
+        (0x614, "PKG_POWER_INFO"),
+        (0x620, "UNCORE_RATIO_LIMIT"),
+        (0x621, "UNCORE_PERF_STATUS"),
+        (0x650, "ATOM_TURBO_RATIO_LIMIT"),
+        (0x651, "ATOM_TURBO_RATIO_LIMIT_CORES"),
+        (0x601, "VR_CURRENT_CONFIG"),
+        (0x64F, "CORE_PERF_LIMIT_REASONS"),
+    ] {
+        w(format!("  0x{index:03X} {name:<30} {}", msr(index, p)));
+    }
+    w(String::new());
+    w("Per logical CPU: PERF_STATUS, TURBO_RATIO_LIMIT, ATOM_TURBO_RATIO_LIMIT, HWP_CAPABILITIES, mailbox 0x1C ceiling".into());
+    for c in cpu.logical_cpus() {
+        let mb = OcMailbox::new(driver.clone(), c.index);
+        let ceiling = match mb.execute(OcMailbox::CMD_READ_CORE_RATIO_CEILING, 0, 0, 0) {
+            Ok((st, d)) => format!("st {st} data 0x{d:08X}"),
+            Err(e) => e.to_string(),
+        };
+        w(format!(
+            "  cpu {:>2} {}: {}  {}  {}  {}  {}",
+            c.index,
+            if c.is_p_core { "P" } else { "E" },
+            msr(0x198, c.index),
+            msr(0x1AD, c.index),
+            msr(0x650, c.index),
+            msr(0x771, c.index),
+            ceiling
+        ));
+    }
+    w(String::new());
+    w(format!("OC mailbox on cpu {p} (status: 0 ok, 1 invalid command, 7 invalid domain):"));
+    let mb = cpu.mailbox();
+    for domain in 0u8..16 {
+        let vf = mb.execute(OcMailbox::CMD_READ_VF, domain, 0, 0);
+        let icc = mb.execute(OcMailbox::CMD_READ_ICCMAX, domain, 0, 0);
+        let fmt = |r: &anyhow::Result<(u8, u32)>| match r {
+            Ok((st, d)) => format!("st {st} 0x{d:08X}"),
+            Err(e) => e.to_string(),
+        };
+        let decoded = match vf {
+            Ok((0, d)) => format!("  = {}", OcMailbox::decode(d)),
+            _ => String::new(),
+        };
+        w(format!("  domain {domain:>2}: VF {}  IccMax {}{decoded}", fmt(&vf), fmt(&icc)));
+    }
+    match mb.execute(OcMailbox::CMD_READ_MISC_TURBO, 0, 0, 0) {
+        Ok((st, d)) => w(format!("  misc turbo (0x18): st {st} 0x{d:08X}")),
+        Err(e) => w(format!("  misc turbo (0x18): {e}")),
+    }
+    #[cfg(target_os = "linux")]
+    {
+        w(String::new());
+        w("Kernel view (cpufreq max kHz per CPU, uncore limits):".into());
+        let read = |p: String| std::fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_else(|_| "--".into());
+        let maxes: Vec<String> = cpu
+            .logical_cpus()
+            .iter()
+            .map(|c| read(format!("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", c.index)))
+            .collect();
+        w(format!("  cpuinfo_max_freq: {}", maxes.join(" ")));
+        let u = "/sys/devices/system/cpu/intel_uncore_frequency/package_00_die_00";
+        w(format!("  uncore: min {} max {} initial max {}", read(format!("{u}/min_freq_khz")), read(format!("{u}/max_freq_khz")), read(format!("{u}/initial_max_freq_khz"))));
+    }
+    write_file(report_path, &text);
+    out!("Written to {}", report_path.display());
+    0
+}
+
 /// Lists the switches.
 fn help() -> i32 {
     out!(
-        "Roch CPU {} - CPU and memory tuning for Intel LGA1700 and AMD Ryzen.
-Run with no arguments for the window. Everything below needs administrator rights.
+        "Roch CPU {} - CPU and memory tuning for Intel LGA1700 and LGA1851 and AMD Ryzen.
+Run with no arguments for the window. Everything below needs administrator rights
+(on Linux: run it with sudo). Reports are written beside the program on Windows and to
+the current directory on Linux.
 
 Reporting
   --probe [file]        hardware readings and current settings; no tuning writes.
   --intel-audit [file]  per-thread Intel register and mailbox readings.
+  --mailbox-scan [file] every OC mailbox domain and the ratio MSRs on every core, raw;
+                        read commands only. For mapping a CPU generation this has not seen.
   --asus-audit         ASUS control metadata and measured clocks; no tuning writes.
   --windows-audit      read this boot's restricted-MSR events; no hardware access.
   --ring-validate      briefly lower the ring ceiling, check live clock, restore.

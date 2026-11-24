@@ -1,4 +1,5 @@
-//! Intel hybrid (Alder Lake / Raptor Lake, LGA1700) CPU access through MSRs.
+//! Intel hybrid CPU access through MSRs: Alder Lake / Raptor Lake (LGA1700) and Arrow Lake
+//! (LGA1851).
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -52,7 +53,52 @@ pub struct PackagePowerLimits {
     pub pl2_enabled: bool,
 }
 
-/// Intel hybrid (Alder Lake / Raptor Lake, LGA1700) CPU access through MSRs.
+/// Which desktop socket a CPU model belongs to. The tuning paths were validated socket by socket,
+/// so the model decides what is offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntelPlatform {
+    /// 12th-14th Gen desktop: Alder Lake-S and Raptor Lake-S.
+    Lga1700,
+    /// Core Ultra 200S and 200S Plus desktop: Arrow Lake-S.
+    Lga1851,
+    /// A hybrid laptop part (Alder/Raptor/Meteor/Arrow Lake-H/P/U). Same registers, no desktop
+    /// board tuning, and the BIOS usually locks it.
+    Mobile,
+    Unknown,
+}
+
+impl IntelPlatform {
+    pub fn socket(self) -> &'static str {
+        match self {
+            IntelPlatform::Lga1700 => "LGA1700",
+            IntelPlatform::Lga1851 => "LGA1851",
+            IntelPlatform::Mobile => "mobile",
+            IntelPlatform::Unknown => "unknown",
+        }
+    }
+}
+
+/// Family 6 model to generation name and platform. `brand` tells the Arrow Lake refresh apart,
+/// which keeps the model number.
+pub fn identify_model(model: i32, brand: &str) -> (String, IntelPlatform) {
+    use IntelPlatform::*;
+    let (name, platform) = match model {
+        0x97 => ("12th Gen (Alder Lake-S)", Lga1700),
+        0x9A => ("12th Gen (Alder Lake-P)", Mobile),
+        0xB7 => ("13th/14th Gen (Raptor Lake-S)", Lga1700),
+        0xBF => ("13th/14th Gen (Raptor Lake-S, Alder Lake die)", Lga1700),
+        0xBA => ("13th Gen (Raptor Lake-P)", Mobile),
+        0xAA | 0xAC => ("Core Ultra Series 1 (Meteor Lake)", Mobile),
+        0xC6 if brand.contains(" Plus") => ("Core Ultra 200S Plus (Arrow Lake-S Refresh)", Lga1851),
+        0xC6 => ("Core Ultra 200S (Arrow Lake-S)", Lga1851),
+        0xC5 => ("Core Ultra 200H/HX (Arrow Lake-H)", Mobile),
+        0xB5 => ("Core Ultra 200U (Arrow Lake-U)", Mobile),
+        _ => return (format!("Family 6 Model 0x{model:02X}"), Unknown),
+    };
+    (name.to_string(), platform)
+}
+
+/// Intel hybrid CPU access through MSRs (LGA1700 and LGA1851).
 /// Nothing here is board specific: everything talks to the CPU itself.
 pub struct IntelCpu {
     drv: Arc<dyn KernelDriver>,
@@ -71,7 +117,7 @@ pub struct IntelCpu {
     first_p_thread: i32,
     first_e_thread: i32,
     generation: String,
-    is_lga1700_family: bool,
+    platform: IntelPlatform,
     mailbox: OcMailbox,
 
     base_ratio: i32,
@@ -128,14 +174,8 @@ impl IntelCpu {
         let (_, _, _, l7_edx) = cpuid(7, 0);
         let is_hybrid = ((l7_edx >> 15) & 1) == 1;
 
-        let (generation, is_lga1700_family) = match model {
-            0x97 => ("12th Gen (Alder Lake-S)".to_string(), true),
-            0x9A => ("12th Gen (Alder Lake-P)".to_string(), false),
-            0xB7 => ("13th/14th Gen (Raptor Lake-S)".to_string(), true),
-            0xBF => ("13th/14th Gen (Raptor Lake-S, Alder Lake die)".to_string(), true),
-            0xBA => ("13th Gen (Raptor Lake-P)".to_string(), false),
-            _ => (format!("Family 6 Model 0x{model:02X}"), false),
-        };
+        let (generation, platform) =
+            if family == 6 { identify_model(model, &brand_string) } else { (format!("Family {family:X}h Model 0x{model:02X}"), IntelPlatform::Unknown) };
 
         let logical_cpus = topology;
         let p_core_count =
@@ -188,7 +228,7 @@ impl IntelCpu {
             first_p_thread,
             first_e_thread,
             generation,
-            is_lga1700_family,
+            platform,
             mailbox,
             base_ratio,
             min_ratio,
@@ -220,7 +260,7 @@ impl IntelCpu {
             first_p_thread: 0,
             first_e_thread: 0,
             generation: String::new(),
-            is_lga1700_family: false,
+            platform: IntelPlatform::Unknown,
             base_ratio: 0,
             min_ratio: 0,
             ratio_limits_programmable: false,
@@ -268,7 +308,18 @@ impl IntelCpu {
         &self.generation
     }
     pub fn is_lga1700_family(&self) -> bool {
-        self.is_lga1700_family
+        self.platform == IntelPlatform::Lga1700
+    }
+    /// A desktop socket this was validated on: LGA1700 or LGA1851.
+    pub fn is_known_desktop(&self) -> bool {
+        matches!(self.platform, IntelPlatform::Lga1700 | IntelPlatform::Lga1851)
+    }
+    pub fn platform(&self) -> IntelPlatform {
+        self.platform
+    }
+    /// Arrow Lake-S on LGA1851.
+    pub fn is_arrow_lake(&self) -> bool {
+        self.platform == IntelPlatform::Lga1851
     }
     pub fn mailbox(&self) -> &OcMailbox {
         &self.mailbox
@@ -310,7 +361,7 @@ impl IntelCpu {
     }
 
     fn enumerate_topology() -> Result<Vec<LogicalCpu>> {
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64);
+        let n = native::logical_cpu_count().min(64);
         let mut list = Vec::with_capacity(n);
         for i in 0..n as i32 {
             let (apic, core_id, pcore) = native::run_on_cpu(i, || {
@@ -431,9 +482,14 @@ impl IntelCpu {
     }
 
     fn brand_says_no_igpu(brand: &str) -> bool {
-        // The model number is the token with a digit after "-", e.g. "i5-14600KF"; its suffix is
-        // the letters after the last digit.
-        brand.split_whitespace().filter(|t| t.contains('-') && t.chars().any(|c| c.is_ascii_digit())).any(|t| {
+        // The model number is the token with a digit after "-", e.g. "i5-14600KF", or on Core
+        // Ultra a bare number of three or more digits, e.g. "Ultra 7 265KF"; its suffix is the
+        // letters after the last digit.
+        let is_model_number = |t: &&str| {
+            (t.contains('-') && t.chars().any(|c| c.is_ascii_digit()))
+                || t.chars().take_while(|c| c.is_ascii_digit()).count() >= 3
+        };
+        brand.split_whitespace().filter(is_model_number).any(|t| {
             let suffix: String = t.chars().rev().take_while(|c| c.is_ascii_alphabetic()).collect();
             suffix.chars().any(|c| c.eq_ignore_ascii_case(&'F'))
         })
@@ -1012,6 +1068,22 @@ mod tests {
         assert!(!IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) i9-14900K"));
         assert!(!IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) i9-14900KS"));
         assert!(!IntelCpu::brand_says_no_igpu("12th Gen Intel(R) Core(TM) i7-12700"));
+        assert!(IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) Ultra 7 265KF"));
+        assert!(IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) Ultra 5 225F"));
+        assert!(!IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) Ultra 7 270K Plus"));
+        assert!(!IntelCpu::brand_says_no_igpu("Intel(R) Core(TM) Ultra 9 285K"));
+    }
+
+    #[test]
+    fn arrow_lake_is_lga1851_and_the_refresh_is_named() {
+        assert_eq!(
+            identify_model(0xC6, "Intel(R) Core(TM) Ultra 7 270K Plus"),
+            ("Core Ultra 200S Plus (Arrow Lake-S Refresh)".to_string(), IntelPlatform::Lga1851)
+        );
+        assert_eq!(identify_model(0xC6, "Intel(R) Core(TM) Ultra 9 285K").1, IntelPlatform::Lga1851);
+        assert_eq!(identify_model(0xB7, "Intel(R) Core(TM) i5-14600KF").1, IntelPlatform::Lga1700);
+        assert_eq!(identify_model(0xC5, "Intel(R) Core(TM) Ultra 9 285H").1, IntelPlatform::Mobile);
+        assert_eq!(identify_model(0x01, "").1, IntelPlatform::Unknown);
     }
 
     #[test]

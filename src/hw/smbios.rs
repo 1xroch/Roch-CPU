@@ -1,6 +1,7 @@
 //! Board / BIOS identification from the raw SMBIOS table (no WMI needed), and the
 //! `GetSystemFirmwareTable` wrapper shared with the BCLK meter.
 
+#[cfg(windows)]
 use super::native;
 
 /// Board / BIOS identification from the raw SMBIOS table (no WMI needed).
@@ -50,7 +51,31 @@ impl SmbiosInfo {
     pub fn read() -> SmbiosInfo {
         match FirmwareTables::get(FirmwareTables::RSMB, 0) {
             Some(raw) => SmbiosInfo::parse(&raw),
+            #[cfg(target_os = "linux")]
+            None => SmbiosInfo::from_sysfs(),
+            #[cfg(not(target_os = "linux"))]
             None => SmbiosInfo::default(),
+        }
+    }
+
+    /// The raw table is root's to read on Linux, but the kernel publishes the identification
+    /// strings to everyone under `/sys/class/dmi/id`. Only the AGESA string (an OEM string) is
+    /// missing from there.
+    #[cfg(target_os = "linux")]
+    pub fn from_sysfs() -> SmbiosInfo {
+        let read = |leaf: &str| {
+            std::fs::read_to_string(format!("/sys/class/dmi/id/{leaf}")).map(|s| s.trim().to_string()).unwrap_or_default()
+        };
+        SmbiosInfo {
+            bios_vendor: read("bios_vendor"),
+            bios_version: read("bios_version"),
+            bios_date: read("bios_date"),
+            system_manufacturer: read("sys_vendor"),
+            system_product: read("product_name"),
+            board_manufacturer: read("board_vendor"),
+            board_product: read("board_name"),
+            board_version: read("board_version"),
+            agesa: String::new(),
         }
     }
 
@@ -144,7 +169,59 @@ impl FirmwareTables {
     }
 
     pub fn get(provider: u32, id: u32) -> Option<Vec<u8>> {
-        native::get_system_firmware_table(provider, id)
+        #[cfg(windows)]
+        {
+            native::get_system_firmware_table(provider, id)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let path = Self::linux_path(provider, id)?;
+            Self::from_linux_file(provider, std::fs::read(path).ok()?)
+        }
+    }
+
+    /// As [`get`](Self::get), and when this process may not read the file itself (Linux, not
+    /// root), through the driver, whose helper can.
+    pub fn get_with(driver: &dyn super::KernelDriver, provider: u32, id: u32) -> Option<Vec<u8>> {
+        if let Some(t) = Self::get(provider, id) {
+            return Some(t);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let path = Self::linux_path(provider, id)?;
+            Self::from_linux_file(provider, driver.read_firmware_file(&path).ok()?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = driver;
+            None
+        }
+    }
+
+    /// Where Linux publishes the table `GetSystemFirmwareTable(provider, id)` would return.
+    #[cfg(target_os = "linux")]
+    fn linux_path(provider: u32, id: u32) -> Option<String> {
+        match provider {
+            Self::ACPI => {
+                let sig: String = id.to_le_bytes().iter().map(|&b| b as char).collect();
+                sig.chars().all(|c| c.is_ascii_alphanumeric()).then(|| format!("/sys/firmware/acpi/tables/{sig}"))
+            }
+            Self::RSMB => Some("/sys/firmware/dmi/tables/DMI".into()),
+            _ => None,
+        }
+    }
+
+    /// SMBIOS comes as bare structures on Linux; Windows prefixes the 8-byte RawSMBIOSData
+    /// header the parser expects, so add one (SMBIOS 3.0, the length of what follows).
+    #[cfg(target_os = "linux")]
+    fn from_linux_file(provider: u32, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        if provider != Self::RSMB {
+            return Some(bytes);
+        }
+        let mut raw = vec![0u8, 3, 0, 0];
+        raw.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&bytes);
+        Some(raw)
     }
 }
 

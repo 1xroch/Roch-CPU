@@ -23,6 +23,8 @@ use anyhow::anyhow;
 use eframe::egui::{self, IconData};
 
 pub use model::UiModel;
+#[cfg(not(windows))]
+pub use win::{CONFIRM_ARG, run_confirm_dialog};
 use preview::{PreviewModel, PreviewOptions};
 use text::APP_NAME;
 

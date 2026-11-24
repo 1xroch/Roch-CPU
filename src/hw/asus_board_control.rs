@@ -1,4 +1,6 @@
 //! ASUS ATK frequency control. Uses the installed vendor COM service; no bundled driver.
+// ASUS control needs ASUS's Windows service; elsewhere it never connects.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use anyhow::{Result, bail};
 
@@ -450,6 +452,72 @@ impl AsusBoardControl {
 }
 
 /// Late-bound COM access to the vendor object (the C# `dynamic` / `InvokeMember` path).
+/// ASUS's vendor service is a Windows COM server (`atkexCom.axdata`). Elsewhere this stands in
+/// with the same surface and never connects, so no ASUS control is offered.
+#[cfg(not(windows))]
+mod com {
+    use anyhow::{Result, bail};
+
+    pub const INIT: &str = "iAcpiInit";
+
+    pub struct Vendor(());
+    pub struct Dispatch(());
+    pub struct Variant(());
+
+    pub enum Arg<'a> {
+        U4(u32),
+        I4(i32),
+        RefU4(&'a mut u32),
+        RefVariant(&'a mut Variant),
+    }
+
+    impl Vendor {
+        pub fn create(_prog_id: &str) -> Result<Vendor> {
+            bail!("ASUS board control uses ASUS's Windows service and is not available on this system")
+        }
+        pub fn run<R: Send + 'static>(&self, _f: impl FnOnce(&Dispatch) -> Result<R> + Send + 'static) -> Result<R> {
+            bail!("ASUS board control is not available on this system")
+        }
+    }
+
+    impl Variant {
+        pub fn bytes(_data: &[u8]) -> Result<Self> {
+            Ok(Variant(()))
+        }
+        pub fn byte_array(&self) -> Option<Vec<u8>> {
+            None
+        }
+        pub fn to_u32(&self, member: &str) -> Result<u32> {
+            bail!("{member}: not available")
+        }
+        pub fn to_u32_explicit(&self) -> Result<u32> {
+            bail!("not available")
+        }
+        pub fn to_i32_checked(&self) -> Result<i32> {
+            bail!("not available")
+        }
+        pub fn to_string_cast(&self) -> Result<Option<String>> {
+            bail!("not available")
+        }
+        pub fn display(&self) -> String {
+            String::new()
+        }
+        pub fn to_dispatch(&self, member: &str) -> Result<Dispatch> {
+            bail!("{member}: not available")
+        }
+    }
+
+    impl Dispatch {
+        pub fn call(&self, name: &str, _args: &mut [Arg<'_>]) -> Result<Variant> {
+            bail!("{name}: not available")
+        }
+        pub fn get(&self, name: &str) -> Result<Variant> {
+            bail!("{name}: not available")
+        }
+    }
+}
+
+#[cfg(windows)]
 mod com {
     use std::mem::ManuallyDrop;
     use std::sync::Mutex;

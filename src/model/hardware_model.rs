@@ -23,11 +23,12 @@ use crate::hw::msi_core_voltage::MsiCoreVoltage;
 use crate::hw::native::{self, lock};
 use crate::hw::oc_mailbox::OcMailbox;
 use crate::hw::smbios::SmbiosInfo;
+#[cfg(not(target_os = "linux"))]
 use crate::hw::smbus_i801::SmbusI801;
+#[cfg(not(target_os = "linux"))]
 use crate::hw::smbus_piix4::SmbusPiix4;
 use crate::hw::super_io::SuperIo;
 use crate::hw::vdd2_rail::Vdd2Rail;
-use crate::hw::winring0::WinRing0Driver;
 use crate::hw::{KernelDriver, Smbus};
 
 mod core_voltage_recovery;
@@ -416,12 +417,16 @@ impl HardwareModel {
     /// Opens the driver and probes the hardware. Never fails: failures are logged and the affected
     /// rows become unavailable.
     pub fn initialize(&self) {
-        match WinRing0Driver::open() {
+        match crate::hw::open_driver() {
             Ok(drv) => {
-                let status = format!("{} (driver v{:X})", drv.name(), drv.get_driver_version());
+                let status = crate::hw::driver_status(drv.as_ref());
                 *lock(&self.driver_status) = status.clone();
-                let _ = self.driver.set(Arc::new(drv));
+                let _ = self.driver.set(drv);
                 self.emit(&format!("Driver: {status}"));
+                #[cfg(target_os = "linux")]
+                if let Some(why) = crate::hw::linux::msr_write_restriction() {
+                    self.emit(&format!("Warning: {why}. Register reads work; tuning writes will be refused."));
+                }
             }
             Err(e) => {
                 *lock(&self.driver_status) = "unavailable".into();
@@ -459,6 +464,13 @@ impl HardwareModel {
     }
 
     fn initialize_smbus(&self, driver: &Arc<dyn KernelDriver>) {
+        // On Linux the kernel's adapter driver owns the controller: go through it.
+        #[cfg(target_os = "linux")]
+        let (bus, st): (Option<Arc<dyn Smbus>>, String) = {
+            let (b, s) = crate::hw::smbus_kernel::SmbusKernel::try_create(driver.clone(), self.is_amd());
+            (b.map(|b| Arc::new(b) as Arc<dyn Smbus>), s)
+        };
+        #[cfg(not(target_os = "linux"))]
         let (bus, st): (Option<Arc<dyn Smbus>>, String) = if self.is_amd() {
             let (b, s) = SmbusPiix4::try_create(driver.clone());
             (b.map(|b| Arc::new(b) as Arc<dyn Smbus>), s)
@@ -503,7 +515,7 @@ impl HardwareModel {
         *lock(&self.super_io_status) = status.clone();
         self.emit(&format!("Super I/O: {status}"));
         let Some(sio) = sio else { return Ok(()) };
-        let sio = Arc::new(sio);
+        let sio = Arc::new(sio.with_board_rails(&self.smbios.board_product));
         let _ = self.super_io.set(sio.clone());
 
         let rails = sio.read_rails();
@@ -520,6 +532,13 @@ impl HardwareModel {
         // where that mailbox exists. The clock controller reads its baseline and
         // does not change the clock until a value is applied.
         if !EcMailbox::is_supported(Some(&sio)) {
+            return Ok(());
+        }
+        // The EC's regulator, clock-generator and VDD2 maps were read off Z790 boards. An
+        // 800-series board with the same EC has a different clock generator and VR wiring, so
+        // nothing on it is driven until it has been mapped the same way.
+        if self.cpu().is_some_and(|c| !c.is_lga1700_family()) {
+            self.emit("MSI EC found, but its core regulator, base clock and CPU VDD2 controls are only mapped on LGA1700 (Z690/Z790) boards; they stay off here.");
             return Ok(());
         }
         // One mailbox instance (and so one transaction lock) shared by the clock generator and
@@ -567,8 +586,8 @@ impl HardwareModel {
                 cpu.base_ratio(),
                 cpu.tj_max()
             ));
-            if !cpu.is_lga1700_family() {
-                self.emit("Warning: this CPU is not a known LGA1700 (12th-14th Gen desktop) part. Ratio/voltage controls may not behave as expected.");
+            if !cpu.is_known_desktop() {
+                self.emit("Warning: this CPU is not a known LGA1700 (12th-14th Gen) or LGA1851 (Core Ultra 200S) desktop part. Ratio/voltage controls may not behave as expected.");
             }
             let oc_locked = cpu.is_oc_locked();
             self.oc_locked.store(oc_locked, Ordering::SeqCst);
@@ -865,7 +884,7 @@ impl HardwareModel {
             o.note = Some(
                 restriction
                     .clone()
-                    .unwrap_or_else(|| format!("Adaptive offset for FIVR domain {domain} (mailbox 0x150). Negative values undervolt. Refused while the domain is in override mode; change the voltage target instead.")),
+                    .unwrap_or_else(|| format!("Adaptive offset for voltage domain {domain} (mailbox 0x150). Negative values undervolt. Refused while the domain is in override mode; change the voltage target instead.")),
             );
             o.available = mb_ok && available;
             [s, o]
@@ -913,15 +932,24 @@ impl HardwareModel {
             o.note = Some("ASUS adaptive SVID offset. Available for changes while CPU Core is in Auto/adaptive mode.".into());
             rows[index] = o;
         }
+        // Arrow Lake has no E-core L2 rail of its own (domain 5 answers "invalid domain") and its
+        // iGPU sits on a separate tile the mailbox does not reach (domain 1 refuses), measured on a
+        // Core Ultra 7 270K Plus. Rows for domains that do not exist only showed a dead Auto, so
+        // on LGA1851 they are left out rather than greyed.
+        let arrow_lake = cpu.as_ref().is_some_and(|c| c.is_arrow_lake());
+        let ecore_readable = mb_ok && domain_readable(OcMailbox::DOMAIN_ECORE);
         // Not gated on the E-core count: the L2 rail for that cluster exists and is settable even
         // when the E-cores are switched off in the BIOS, which is exactly what the vendor tool shows.
-        rows.extend(add_domain("ecore", "CPU E-Core L2", OcMailbox::DOMAIN_ECORE, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_ECORE)));
+        if !arrow_lake || ecore_readable {
+            rows.extend(add_domain("ecore", "CPU E-Core L2", OcMailbox::DOMAIN_ECORE, 0.600, 1.520, ecore_readable));
+        }
         rows.extend(add_domain("ring", "Ring", OcMailbox::DOMAIN_RING, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_RING)));
         rows.extend(add_domain("sa", "SA", OcMailbox::DOMAIN_SA, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_SA)));
         // No GT rows without an integrated GPU: "F" parts (i5-14600KF and the like) have none, so
         // the GT domain is an empty slot and the rows only showed a meaningless Auto.
-        if cpu.as_ref().is_none_or(|c| c.has_integrated_graphics()) {
-            rows.extend(add_domain("gt", "GT (iGPU)", OcMailbox::DOMAIN_GT, 0.600, 1.520, mb_ok && domain_readable(OcMailbox::DOMAIN_GT)));
+        let gt_readable = mb_ok && domain_readable(OcMailbox::DOMAIN_GT);
+        if cpu.as_ref().is_none_or(|c| c.has_integrated_graphics()) && (!arrow_lake || gt_readable) {
+            rows.extend(add_domain("gt", "GT (iGPU)", OcMailbox::DOMAIN_GT, 0.600, 1.520, gt_readable));
         }
 
         if let Some(asus) = self.asus_control() {
@@ -957,6 +985,7 @@ impl HardwareModel {
             add_asus_rail("ring", "Ring", AsusBoardControl::RING_ID, asus.baseline_ring());
         }
 
+        // On LGA1851 the same holds: domain 2 reports the core domain's IccMax, the shared VccIA.
         // On LGA1700 the ring has no rail of its own: it runs from the P-core Vcore rail, which is
         // why MSI Dragon Power offers no ring voltage at all. A mailbox ring target or offset only
         // adds a request the shared VR may or may not honour. Keep the ASUS Cache SVID row (a real
