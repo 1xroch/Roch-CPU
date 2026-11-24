@@ -93,7 +93,7 @@ measuring the board's response, as `BclkController` and `Vdd2Rail` document.
 
 The Linux transport (an unprivileged window with a `pkexec` helper over a pipe, the helper's
 refusals, and the `flock` files that stand in for the Windows named mutexes) follows the design of
-[Roch Viewer](https://github.com/RochStudio/Roch-Viewer), the same author's project, and uses the
+[Roch Viewer](https://github.com/1xroch/Roch-Viewer), the same author's project, and uses the
 same lock-file names so the tools serialise against each other. The Z890 AORUS TACHYON ICE's ITE
 IT8696E input map (Vcore, VNNAON, VCCSA) is Roch Viewer's confirmed map.
 
@@ -107,5 +107,5 @@ calls.
 
 ## The Roch mark
 
-The `assets/` artwork is shared with [Roch GPU](https://github.com/RochStudio/Roch-GPU) and
-[Roch Viewer](https://github.com/RochStudio/Roch-Viewer).
+The `assets/` artwork is shared with [Roch GPU](https://github.com/1xroch/Roch-GPU) and
+[Roch Viewer](https://github.com/1xroch/Roch-Viewer).

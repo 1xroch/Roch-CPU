@@ -6,8 +6,8 @@
 
 CPU and memory tuning for **Intel LGA1700** (12th/13th/14th Gen on any 600/700-series board) and
 **AMD Ryzen** (Zen 2–Zen 5, AM4/AM5). One dark window, typeable values, a log — the third Roch
-Studio tool, next to [Roch GPU](https://github.com/RochStudio/Roch-GPU) and
-[Roch Viewer](https://github.com/RochStudio/Roch-Viewer).
+Studio tool, next to [Roch GPU](https://github.com/1xroch/Roch-GPU) and
+[Roch Viewer](https://github.com/1xroch/Roch-Viewer).
 
 It began as a re-creation of the reference tuning tool that does not need an MSI board. Almost everything
 it does goes through interfaces every LGA1700 CPU and every Intel 600/700-series chipset expose
