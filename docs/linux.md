@@ -83,6 +83,23 @@ What changed for Arrow Lake:
 
 The core domain refusing writes while SA accepts them is what Intel's undervolt protection looks like; with it off in the BIOS the core rows become writable. The kernel logged "Write to unrecognized MSR ... tainting CPU_OUT_OF_SPEC" for the MSR writes, as expected.
 
+### Board regulators: VCCSA (NGU) and VNNAON (D2D)
+
+On the Z890 AORUS TACHYON ICE two Renesas PMBus controllers sit on the PCH's serial I2C bus (`i2c-0`, the first DesignWare adapter), which Linux can reach:
+
+| Address / page | Rail | Mode as found |
+| --- | --- | --- |
+| 0x60 / 0 | Vcore (VccIA) | SVID: the CPU sets it |
+| 0x60 / 1 | VccGT | off |
+| 0x62 / 1 | VCCSA: memory controller and NGU | fixed by the board at 1.320 V |
+| 0x62 / 2 | VNNAON: always-on SoC, D2D | fixed by the board at 0.850 V |
+
+A rail the board holds fixed follows VOUT_COMMAND, the register the BIOS set it through, so **VCCSA** and **VNNAON** rows (Board rails) change it there and check the regulator's own output reading. With +10 mV each, the output moved 1.307 → 1.316 V and 0.849 → 0.858 V. The helper allows only page selects and targets of 0.5-1.5 V on these two chips, never the mode register, so a rail the CPU drives stays the CPU's: Vcore is shown, read-only, with who controls it.
+
+Because the board holds VCCSA fixed, the CPU's own SA request (mailbox domain 4) changes nothing on this board, so the mailbox SA rows are replaced by the regulator row here.
+
+VDD2 is not on a bus Linux can see: neither PCH I2C nor SMBus has a third regulator, so it is probably behind the ITE chip's own SMBus master. DLVR is inside the CPU and follows the core domain, which undervolt protection locks.
+
 ### D2D and NGU
 
 Arrow Lake has two more fabric clocks: D2D, the die-to-die link between the compute and SoC tiles (30x on 200S Plus, 21x on the original 200S), and NGU, the SoC tile's network on chip (26-28x), on VnnAON and VccSA respectively. Neither is offered here:

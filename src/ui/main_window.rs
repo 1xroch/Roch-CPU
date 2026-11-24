@@ -350,6 +350,11 @@ impl MainWindow {
         self.reset_enabled = true;
         self.set_status(format!("Ready  \u{00B7}  {}", m.driver_status()), false);
         self.phase = Phase::Ready;
+        // ROCHCPU_OPEN_PER_CORE=1 opens the per-core table once ready: for checking that window
+        // on a machine without a mouse to drive, and for screenshots.
+        if std::env::var_os("ROCHCPU_OPEN_PER_CORE").is_some() && self.per_core_enabled {
+            self.open_per_core();
+        }
 
         self.last_tick = Some(Instant::now());
         self.slow_tick();
@@ -964,8 +969,15 @@ impl MainWindow {
         if self.is_preview() {
             return;
         }
-        let parent = self.ctx.input(|i| i.viewport().outer_rect);
-        let centre = |size: Vec2| parent.map(|r| r.center() - size / 2.0);
+        // A dialog that is a window of its own goes over the centre of the main window, in screen
+        // coordinates. Where the backend draws it inside the main window instead (Wayland, which
+        // gives a program no screen positions), centre it in the main window's own area.
+        let parent = if self.ctx.embed_viewports() {
+            Some(self.ctx.content_rect())
+        } else {
+            self.ctx.input(|i| i.viewport().outer_rect)
+        };
+        let centre = |size: Vec2| parent.map(|r| (r.center() - size / 2.0).max(r.min));
         if self.model.is_amd() {
             let mut d = CurveOptimizerDialog::new(self.model.clone());
             d.position = centre(d.size());

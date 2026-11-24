@@ -147,6 +147,8 @@ pub struct HardwareModel {
     vdd2: OnceLock<Arc<Vdd2Rail>>,
     bclk_control: OnceLock<Arc<BclkController>>,
     super_io: OnceLock<Arc<SuperIo>>,
+    #[cfg(target_os = "linux")]
+    board_vr: OnceLock<Arc<crate::hw::board_vr::BoardVr>>,
     dimms: Mutex<Vec<Arc<Ddr5Dimm>>>,
     smbus: OnceLock<Arc<dyn Smbus>>,
     ctx: Arc<Ctx>,
@@ -227,6 +229,8 @@ impl HardwareModel {
             vdd2: OnceLock::new(),
             bclk_control: OnceLock::new(),
             super_io: OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            board_vr: OnceLock::new(),
             dimms: Mutex::new(Vec::new()),
             smbus: OnceLock::new(),
             ctx: Arc::new(Ctx {
@@ -298,6 +302,10 @@ impl HardwareModel {
     }
     pub fn smbus(&self) -> Option<Arc<dyn Smbus>> {
         self.smbus.get().cloned()
+    }
+    #[cfg(target_os = "linux")]
+    pub fn board_vr(&self) -> Option<Arc<crate::hw::board_vr::BoardVr>> {
+        self.board_vr.get().cloned()
     }
     pub fn super_io(&self) -> Option<Arc<SuperIo>> {
         self.super_io.get().cloned()
@@ -452,6 +460,10 @@ impl HardwareModel {
 
             self.initialize_smbus(&driver);
             self.initialize_super_io(&driver);
+            #[cfg(target_os = "linux")]
+            if self.cpu().is_some() {
+                self.initialize_board_vr(&driver);
+            }
         }
 
         if self.cpu().is_some() {
@@ -506,6 +518,33 @@ impl HardwareModel {
             }
         }
         lock(&self.dimms).extend(found);
+    }
+
+    /// The board's PMBus regulators, where the board wires them to an I2C bus Linux reaches.
+    #[cfg(target_os = "linux")]
+    fn initialize_board_vr(&self, driver: &Arc<dyn KernelDriver>) {
+        use crate::hw::board_vr::{BoardVr, VrRail};
+        let (vr, status) = BoardVr::try_create(driver.clone(), &self.smbios.board_product);
+        let Some(vr) = vr else {
+            if crate::hw::board_vr::board_is_mapped(&self.smbios.board_product) {
+                self.emit(&format!("Board regulators: {status}"));
+            }
+            return;
+        };
+        let pages: Vec<String> = [VrRail::Vcore, VrRail::VccSa, VrRail::VnnAon]
+            .iter()
+            .map(|&r| match vr.read(r) {
+                Ok(p) => format!(
+                    "{} {:.3} V ({})",
+                    r.name(),
+                    p.output_mv as f64 / 1000.0,
+                    if p.fixed() { format!("fixed at {:.3} V", p.target_mv as f64 / 1000.0) } else { "set by the CPU".into() }
+                ),
+                Err(e) => format!("{} unreadable: {e}", r.name()),
+            })
+            .collect();
+        self.emit(&format!("Board regulators: {status}; {}", pages.join(", ")));
+        let _ = self.board_vr.set(Arc::new(vr));
     }
 
     fn initialize_super_io(&self, driver: &Arc<dyn KernelDriver>) {
@@ -1407,11 +1446,60 @@ impl HardwareModel {
 
     // ------------------------------------------------------------------ shared rows
     fn build_board_rails(&self, rows: &mut Vec<Setting>) {
+        #[cfg(target_os = "linux")]
+        self.add_board_vr_rows(rows);
         // Board rails come from the motherboard's regulators, not a CPU register. Only CPU VDD2 is
         // shown: it is settable on MSI EC boards. The read-only CPU AUX row was removed on request
         // (it could not be set, and its reading is still in the start-up Log line "Board rails").
         let Some(sio) = self.super_io() else { return };
         self.add_vdd2_row(rows, &sio);
+    }
+
+    /// VCCSA and VNNAON through the board's own regulator, where the board holds them fixed; Vcore
+    /// shown with who controls it.
+    #[cfg(target_os = "linux")]
+    fn add_board_vr_rows(&self, rows: &mut Vec<Setting>) {
+        use crate::hw::board_vr::VrRail;
+        let Some(vr) = self.board_vr.get().cloned() else { return };
+        for (id, name, rail, what) in [
+            ("vr_vcore", "Vcore (board VR)", VrRail::Vcore, "the CPU cores and ring (VccIA)"),
+            ("vr_vccsa", "VCCSA (NGU, IMC)", VrRail::VccSa, "the SoC tile: memory controller and NGU fabric"),
+            ("vr_vnnaon", "VNNAON (D2D)", VrRail::VnnAon, "the always-on SoC rail, which also feeds the D2D link"),
+        ] {
+            let Ok(page) = vr.read(rail) else { continue };
+            let (lo, hi) = rail.range();
+            let mut s = Setting::new(id, name, SettingGroup::Board);
+            s.unit = "V".into();
+            s.min = lo;
+            s.max = hi;
+            s.decimals = 3;
+            s.require_read_back = true;
+            let r = vr.clone();
+            s.read = Arc::new(move || r.read_target(rail));
+            if page.fixed() {
+                let (w, d) = (vr.clone(), vr.clone());
+                let startup = page.target_mv as f64 / 1000.0;
+                s.write = Some(Arc::new(move |v| w.set_target(rail, v)));
+                s.restore_default = Some(Arc::new(move || d.set_target(rail, startup)));
+                s.default_value = Some(startup);
+                s.note = Some(format!(
+                    "Target of the board regulator that powers {what}, written over PMBus to the same register the BIOS set it through. The regulator's own output reading is checked after every write. Enter 0 to put back {startup:.3} V."
+                ));
+            } else {
+                s.note = Some(format!(
+                    "Read-only: the CPU sets this rail over SVID. Changing it here would mean taking the rail away from the CPU, which this does not do. Output now {:.3} V.",
+                    page.output_mv as f64 / 1000.0
+                ));
+            }
+            s.available = true;
+            rows.push(s);
+        }
+        // The CPU's SA request (OC mailbox domain 4) does not reach a rail the board holds fixed:
+        // writing it changed nothing on the VCCSA sensor. Keep only the row that works.
+        if vr.read(VrRail::VccSa).is_ok_and(|p| p.fixed()) && rows.iter().any(|r| r.id == "sa_v") {
+            rows.retain(|r| r.id != "sa_v" && r.id != "sa_off");
+            self.emit("SA: the board regulator holds VCCSA fixed, so the CPU's SA request has no effect here; VCCSA is set through the regulator instead (Board rails).");
+        }
     }
 
     /// CPU VDD2. Measured at the Super I/O either way; settable as well where the regulator on the

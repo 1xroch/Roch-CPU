@@ -73,13 +73,29 @@ struct Snapshot {
     ceilings: Vec<(i32, Option<i32>)>,
     domains: Vec<(i32, Option<u32>)>,
     dimms: Vec<(Option<f64>, Option<f64>, Option<f64>)>,
+    /// Board regulator targets (mV) by row id, for the rails the board holds fixed.
+    vr: Vec<(&'static str, u16)>,
+}
+
+#[cfg(target_os = "linux")]
+fn vr_targets(hw: &HardwareModel) -> Vec<(&'static str, u16)> {
+    use crate::hw::board_vr::VrRail;
+    let Some(vr) = hw.board_vr() else { return Vec::new() };
+    [("vr_vccsa", VrRail::VccSa), ("vr_vnnaon", VrRail::VnnAon)]
+        .into_iter()
+        .filter_map(|(id, rail)| vr.read(rail).ok().filter(|p| p.fixed()).map(|p| (id, p.target_mv)))
+        .collect()
+}
+#[cfg(not(target_os = "linux"))]
+fn vr_targets(_hw: &HardwareModel) -> Vec<(&'static str, u16)> {
+    Vec::new()
 }
 
 fn msr(d: &dyn KernelDriver, index: u32, cpu: i32) -> Result<u64> {
     d.read_msr(index, cpu).ok_or_else(|| anyhow!("RDMSR 0x{index:X} on CPU {cpu}: {}", d.last_error().unwrap_or_default()))
 }
 
-fn take(cpu: &IntelCpu, dimms: &[Arc<Ddr5Dimm>]) -> Result<Snapshot> {
+fn take(hw: &HardwareModel, cpu: &IntelCpu, dimms: &[Arc<Ddr5Dimm>]) -> Result<Snapshot> {
     let d = cpu.driver().as_ref();
     let p = cpu.first_p_thread();
     let e_threads: Vec<i32> = cpu.logical_cpus().iter().filter(|c| !c.is_p_core).map(|c| c.index).collect();
@@ -95,6 +111,7 @@ fn take(cpu: &IntelCpu, dimms: &[Arc<Ddr5Dimm>]) -> Result<Snapshot> {
             .collect(),
         domains: DOMAINS.iter().map(|&dom| (dom, cpu.mailbox().read_domain(dom).ok().map(|s| OcMailbox::encode(&s)))).collect(),
         dimms: dimms.iter().map(|m| (m.read_vdd(), m.read_vddq(), m.read_vpp())).collect(),
+        vr: vr_targets(hw),
     })
 }
 
@@ -108,7 +125,7 @@ fn put_msr(d: &dyn KernelDriver, index: u32, value: u64, cpu: i32, failures: &mu
 }
 
 /// Writes the snapshot back: tables first, so a ceiling going back up is not capped by them.
-fn restore(cpu: &IntelCpu, dimms: &[Arc<Ddr5Dimm>], s: &Snapshot) -> Vec<String> {
+fn restore(hw: &HardwareModel, cpu: &IntelCpu, dimms: &[Arc<Ddr5Dimm>], s: &Snapshot) -> Vec<String> {
     let d = cpu.driver().as_ref();
     let p = cpu.first_p_thread();
     let mut failures = Vec::new();
@@ -136,6 +153,20 @@ fn restore(cpu: &IntelCpu, dimms: &[Arc<Ddr5Dimm>], s: &Snapshot) -> Vec<String>
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    if let Some(vr) = hw.board_vr() {
+        use crate::hw::board_vr::VrRail;
+        for &(id, mv) in &s.vr {
+            let rail = if id == "vr_vccsa" { VrRail::VccSa } else { VrRail::VnnAon };
+            if vr.read(rail).ok().map(|p| p.target_mv) != Some(mv) {
+                if let Err(e) = vr.set_target(rail, mv as f64 / 1000.0) {
+                    failures.push(format!("{id} back to {mv} mV: {e}"));
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = hw;
     for (m, &(vdd, vddq, vpp)) in dimms.iter().zip(&s.dimms) {
         let rails: [(&str, Option<f64>, Option<f64>, &dyn Fn(f64) -> Result<()>); 3] = [
             ("VDD", vdd, m.read_vdd(), &|v| m.write_vdd(v)),
@@ -260,7 +291,7 @@ pub fn run(path: &Path) -> i32 {
         return 1;
     }
     let dimms = hw.dimms();
-    let snapshot = match take(&cpu, &dimms) {
+    let snapshot = match take(&hw, &cpu, &dimms) {
         Ok(s) => s,
         Err(e) => {
             r.line(format!("Snapshot failed, nothing written: {e}"));
@@ -283,11 +314,11 @@ pub fn run(path: &Path) -> i32 {
 
     r.line("");
     r.line("Restoring the snapshot:");
-    let failures = restore(&cpu, &dimms, &snapshot);
+    let failures = restore(&hw, &cpu, &dimms, &snapshot);
     for f in &failures {
         r.line(format!("  could not restore {f}"));
     }
-    match take(&cpu, &dimms) {
+    match take(&hw, &cpu, &dimms) {
         Ok(after) => {
             let same = after == snapshot;
             r.check("everything back as found", same && failures.is_empty(), if same { "every register reads its start value".to_string() } else { format!("now {after:?}") });
@@ -310,6 +341,11 @@ pub fn run(path: &Path) -> i32 {
     let _ = std::fs::write(path, &r.text);
     println!("Written to {}", path.display());
     if r.failed == 0 { 0 } else { 2 }
+}
+
+fn rail_reading(sio: &Option<Arc<SuperIo>>, index: i32) -> Option<f64> {
+    let s = sio.clone()?;
+    mean(5, || s.read_voltage(index))
 }
 
 fn tests(r: &mut Report, hw: &HardwareModel, cpu: &Arc<IntelCpu>, dimms: &[Arc<Ddr5Dimm>]) -> Result<()> {
@@ -521,6 +557,48 @@ fn tests(r: &mut Report, hw: &HardwareModel, cpu: &Arc<IntelCpu>, dimms: &[Arc<D
         r.check("offset refused and SA still fixed", refused && still_fixed, format!("refused {refused}, override kept {still_fixed}"));
     } else {
         r.note("SA voltage", "no SA row here");
+    }
+
+    // ---- board regulators
+    #[cfg(target_os = "linux")]
+    if let Some(vr) = hw.board_vr() {
+        use crate::hw::board_vr::VrRail;
+        for (id, rail, sensor) in [("vr_vccsa", VrRail::VccSa, 6), ("vr_vnnaon", VrRail::VnnAon, 5)] {
+            r.line("");
+            r.line(format!("{} (board regulator):", rail.name()));
+            let Some(row_now) = hw.setting(id) else {
+                r.note(id, "no row (the rail is not fixed by the board)");
+                continue;
+            };
+            if row_now.read_only() {
+                r.note(id, row_now.note.unwrap_or_default());
+                continue;
+            }
+            let Some(start) = row(hw, id) else {
+                r.note(id, "target unreadable");
+                continue;
+            };
+            let out_before = mean(5, || vr.read_output(rail));
+            let sensor_before = rail_reading(&sio, sensor);
+            let target = ((start + 0.010) * 1000.0).round() / 1000.0;
+            if apply(r, hw, id, target) {
+                std::thread::sleep(Duration::from_millis(200));
+                let out_after = mean(5, || vr.read_output(rail));
+                let sensor_after = rail_reading(&sio, sensor);
+                let moved = out_after.zip(out_before).map(|(a, b)| (a - b) * 1000.0);
+                r.check(
+                    "the regulator's output follows",
+                    moved.is_some_and(|m| (5.0..=15.0).contains(&m)),
+                    format!("target {start:.3} -> {target:.3} V, output {out_before:?} -> {out_after:?} V"),
+                );
+                r.note("board sensor (12 mV steps)", format!("{sensor_before:?} -> {sensor_after:?} V"));
+            } else {
+                r.check(&format!("{id} accepted"), false, "refused");
+            }
+            if !apply(r, hw, id, start) {
+                bail!("{id} could not be put back to {start:.3} V");
+            }
+        }
     }
 
     // ---- DIMMs

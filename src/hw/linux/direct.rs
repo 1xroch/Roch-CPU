@@ -96,6 +96,26 @@ pub fn smbus_is_allowed(address: u8, transfer: KernelSmbus) -> bool {
             matches!(address, 0x18..=0x1F | 0x48..=0x57)
         }
         KernelSmbus::WriteByte { .. } => matches!(address, 0x48..=0x4F),
+        KernelSmbus::WriteWord { .. } => false,
+    }
+}
+
+/// The board voltage regulators on the PCH's serial I2C bus (Renesas PMBus controllers at 0x60
+/// and 0x62), on boards where they have been mapped. Anything may be read. The only writes are
+/// the PAGE selector (pages 0-2) and VOUT_COMMAND within 0.5-1.5 V: never the mode register,
+/// so a rail the CPU drives over SVID stays the CPU's, and never the regulator's protection
+/// limits or NVM.
+pub fn vr_is_allowed(board: &str, adapter_name: &str, address: u8, transfer: KernelSmbus) -> bool {
+    if !super::super::board_vr::board_is_mapped(board)
+        || !adapter_name.starts_with("Synopsys DesignWare I2C adapter")
+        || !matches!(address, 0x60 | 0x62)
+    {
+        return false;
+    }
+    match transfer {
+        KernelSmbus::ReadByte { .. } | KernelSmbus::ReadWord { .. } => true,
+        KernelSmbus::WriteByte { register, value } => register == 0x00 && value <= 2,
+        KernelSmbus::WriteWord { register, value } => register == 0x21 && (500..=1500).contains(&value),
     }
 }
 
@@ -320,8 +340,11 @@ impl Direct {
     }
 
     pub fn smbus(&self, adapter: u32, address: u8, transfer: KernelSmbus) -> Result<u16> {
-        if !smbus_is_allowed(address, transfer) {
-            bail!("SMBus {transfer:?} at 0x{address:02X} is outside the DDR5 SPD/PMIC allowlist; refused.");
+        let adapter_name = std::fs::read_to_string(format!("/sys/bus/i2c/devices/i2c-{adapter}/name")).unwrap_or_default();
+        let board = std::fs::read_to_string("/sys/class/dmi/id/board_name").unwrap_or_default();
+        let pch_smbus = adapter_name.starts_with("SMBus ");
+        if !(pch_smbus && smbus_is_allowed(address, transfer) || vr_is_allowed(board.trim(), adapter_name.trim(), address, transfer)) {
+            bail!("SMBus {transfer:?} at 0x{address:02X} on i2c-{adapter} is outside the allowlist; refused.");
         }
         let mut files = lock(&self.i2c);
         let fd = match files.entry(adapter) {
@@ -344,6 +367,10 @@ impl Direct {
                 data.byte = value;
                 (I2C_SMBUS_WRITE, register, I2C_SMBUS_BYTE_DATA)
             }
+            KernelSmbus::WriteWord { register, value } => {
+                data.word = value;
+                (I2C_SMBUS_WRITE, register, I2C_SMBUS_WORD_DATA)
+            }
         };
         let mut args = I2cSmbusIoctlData { read_write, command, size, data: &mut data };
         // SAFETY: args and data outlive the call and have the kernel's layout.
@@ -355,7 +382,7 @@ impl Direct {
             match transfer {
                 KernelSmbus::ReadByte { .. } => data.byte as u16,
                 KernelSmbus::ReadWord { .. } => data.word,
-                KernelSmbus::WriteByte { .. } => 0,
+                KernelSmbus::WriteByte { .. } | KernelSmbus::WriteWord { .. } => 0,
             }
         })
     }
@@ -467,6 +494,22 @@ mod tests {
         assert!(!smbus_is_allowed(0x50, KernelSmbus::WriteByte { register: 0x0B, value: 0 }));
         assert!(smbus_is_allowed(0x48, KernelSmbus::WriteByte { register: 0x21, value: 0x78 }));
         assert!(!smbus_is_allowed(0x30, KernelSmbus::ReadByte { register: 0 }));
+    }
+
+    #[test]
+    fn board_regulators_take_only_page_and_target_writes() {
+        let (b, a) = ("Z890 AORUS TACHYON ICE", "Synopsys DesignWare I2C adapter");
+        assert!(vr_is_allowed(b, a, 0x62, KernelSmbus::ReadWord { register: 0xF0 }));
+        assert!(vr_is_allowed(b, a, 0x62, KernelSmbus::WriteByte { register: 0x00, value: 2 }));
+        assert!(vr_is_allowed(b, a, 0x62, KernelSmbus::WriteWord { register: 0x21, value: 1320 }));
+        // The mode register, a page past the mapped ones, out-of-range targets, other boards.
+        assert!(!vr_is_allowed(b, a, 0x62, KernelSmbus::WriteWord { register: 0xF0, value: 0x2232 }));
+        assert!(!vr_is_allowed(b, a, 0x62, KernelSmbus::WriteByte { register: 0x00, value: 3 }));
+        assert!(!vr_is_allowed(b, a, 0x62, KernelSmbus::WriteWord { register: 0x21, value: 1600 }));
+        assert!(!vr_is_allowed(b, a, 0x62, KernelSmbus::WriteWord { register: 0x21, value: 400 }));
+        assert!(!vr_is_allowed("Z790 MPOWER", a, 0x62, KernelSmbus::ReadByte { register: 0x98 }));
+        assert!(!vr_is_allowed(b, "SMBus I801 adapter at 0000:80:1f.4", 0x62, KernelSmbus::ReadByte { register: 0x98 }));
+        assert!(!vr_is_allowed(b, a, 0x50, KernelSmbus::ReadByte { register: 0 }));
     }
 
     #[test]

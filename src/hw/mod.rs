@@ -20,6 +20,8 @@ pub mod amd_smu;
 pub mod asus_audit;
 pub mod asus_board_control;
 pub mod bclk_controller;
+#[cfg(target_os = "linux")]
+pub mod board_vr;
 pub mod bclk_meter;
 pub mod core_page_probe;
 pub mod core_voltage_pair_transaction;
@@ -107,6 +109,7 @@ pub enum KernelSmbus {
     ReadByte { register: u8 },
     ReadWord { register: u8 },
     WriteByte { register: u8, value: u8 },
+    WriteWord { register: u8, value: u16 },
 }
 
 /// Opens this platform's kernel driver: WinRing0 on Windows; on Linux the kernel's own

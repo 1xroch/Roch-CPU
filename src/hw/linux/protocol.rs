@@ -89,8 +89,12 @@ impl Request {
                     KernelSmbus::ReadByte { register } => (0, register, 0),
                     KernelSmbus::ReadWord { register } => (1, register, 0),
                     KernelSmbus::WriteByte { register, value } => (2, register, value),
+                    KernelSmbus::WriteWord { register, .. } => (3, register, 0),
                 };
                 p.extend_from_slice(&[kind, register, value]);
+                if let KernelSmbus::WriteWord { value, .. } = *transfer {
+                    p.extend_from_slice(&value.to_le_bytes());
+                }
                 8
             }
             Request::MeasureBclk { cpu, sample_ms } => {
@@ -130,6 +134,7 @@ impl Request {
                     0 => KernelSmbus::ReadByte { register: u8_at(6)? },
                     1 => KernelSmbus::ReadWord { register: u8_at(6)? },
                     2 => KernelSmbus::WriteByte { register: u8_at(6)?, value: u8_at(7)? },
+                    3 => KernelSmbus::WriteWord { register: u8_at(6)?, value: u16_at(8)? },
                     _ => return Err(bad()),
                 },
             },
@@ -194,6 +199,7 @@ mod tests {
             KernelSmbus::ReadByte { register: 0x31 },
             KernelSmbus::ReadWord { register: 0x05 },
             KernelSmbus::WriteByte { register: 0x30, value: 0x05 },
+            KernelSmbus::WriteWord { register: 0x21, value: 0x0528 },
         ] {
             round_trip(Request::KernelSmbus { adapter: 22, address: 0x48, transfer });
         }
