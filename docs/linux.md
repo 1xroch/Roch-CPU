@@ -78,10 +78,14 @@ What changed for Arrow Lake:
 | SA Voltage | 1.196 → 1.205 V | read back; the board's VCCSA input did not move a 12 mV step | pass |
 | SA offset while SA is fixed | -5 mV | refused, SA kept fixed | pass |
 | DIMM VDD / VDDQ / VPP, both DIMMs | +15 mV | each PMIC's ADC moved 10-15 mV | pass |
-| CPU Core Voltage and offset | -10 mV / fixed | refused by the CPU: 0x13 to a change, 0x08 to a no-change write | read-only |
+| CPU Core Voltage Offset | -10 mV | loaded VID 1.2937 → 1.2837 V (-10.0 mV); 0 put it back | pass (Undervolt Protection off) |
+| CPU Core Voltage (fixed) | override 1.310 V | read back as override with target 0 and ratio x55: the CPU discards the target in this format; rolled back | read-only on Arrow Lake |
+| VCCSA / VNNAON (board regulator) | +10 mV | the regulator's output followed (1.307 → 1.315 V, 0.850 → 0.858 V) | pass |
 | Restore | | every register back to its start value | pass |
 
-The core domain refusing writes while SA accepts them is what Intel's undervolt protection looks like; with it off in the BIOS the core rows become writable. The kernel logged "Write to unrecognized MSR ... tainting CPU_OUT_OF_SPEC" for the MSR writes, as expected.
+With the BIOS's **Undervolt Protection** on, every change to the core domain answers 0x13; with it off the same write is accepted. 0x08 means busy: straight after a voltage change the CPU refuses the next write for a moment (putting an offset back to 0 at once failed, 200 ms later it was accepted), and writing a domain's own value back answers it too. Writes retry on 0x08 for up to a second.
+
+The board's Vcore sensor swings by several hundred millivolts at idle on Arrow Lake, so it cannot confirm a 10 mV offset; there the CPU's own VID following the request is taken as the confirmation, and the Log says so. The kernel logged "Write to unrecognized MSR ... tainting CPU_OUT_OF_SPEC" for the MSR writes, as expected.
 
 ### Board regulators: VCCSA (NGU) and VNNAON (D2D)
 

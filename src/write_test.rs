@@ -481,6 +481,7 @@ fn tests(r: &mut Report, hw: &HardwareModel, cpu: &Arc<IntelCpu>, dimms: &[Arc<D
     r.line("CPU Core Voltage Offset:");
     let before = under_load(cpu, &p_threads, &p_threads);
     let core_locked = hw.setting("core_off").is_some_and(|s| s.read_only());
+    let fixed_offered = hw.setting("core_v").is_some_and(|s| !s.read_only());
     if core_locked {
         r.note("core voltage rows", hw.setting("core_off").and_then(|s| s.note).unwrap_or_default());
         let refused = !hw.apply("core_off", -10.0);
@@ -505,8 +506,8 @@ fn tests(r: &mut Report, hw: &HardwareModel, cpu: &Arc<IntelCpu>, dimms: &[Arc<D
     r.line("");
     r.line("CPU Core Voltage (fixed):");
     let target = ((before.vid + 0.02) * 200.0).round() / 200.0;
-    if core_locked {
-        r.note("core voltage", "read-only on this machine; skipped");
+    if core_locked || !fixed_offered {
+        r.note("fixed core voltage", hw.setting("core_v").and_then(|s| s.note).unwrap_or_else(|| "not offered; skipped".into()));
     } else if before.vid > 0.5 && target <= 1.35 {
         let vcore_before = rail(0);
         if apply(r, hw, "core_v", target) {

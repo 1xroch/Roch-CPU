@@ -136,6 +136,9 @@ pub fn run(args: &[String]) -> i32 {
     if eq(a0, "--write-test") {
         return crate::write_test::run(&arg_or(args, 1, dir.join("write-test.txt")));
     }
+    if eq(a0, "--core-offset-probe") {
+        return core_offset_probe();
+    }
     if eq(a0, "--mailbox-scan") {
         return mailbox_scan(&arg_or(args, 1, dir.join("mailbox-scan.txt")));
     }
@@ -1294,6 +1297,50 @@ fn mailbox_scan(report_path: &Path) -> i32 {
     0
 }
 
+/// Raw answers of the core voltage domain to a no-change write and to a -5 mV offset, each read
+/// back and the original put back. For telling "locked" from "nothing to change" on a new CPU.
+fn core_offset_probe() -> i32 {
+    let driver = match crate::hw::open_driver() {
+        Ok(d) => d,
+        Err(e) => {
+            out!("Driver: {e}");
+            return 1;
+        }
+    };
+    let cpu = match IntelCpu::new(driver) {
+        Ok(c) => c,
+        Err(e) => {
+            out!("CPU: {e}");
+            return 1;
+        }
+    };
+    let mb = cpu.mailbox();
+    let read = || mb.execute(OcMailbox::CMD_READ_VF, 0, 0, 0);
+    let Ok((0, original)) = read() else {
+        out!("domain 0 unreadable: {:?}", read());
+        return 1;
+    };
+    out!("domain 0 now 0x{original:08X} = {}", OcMailbox::decode(original));
+    let mut tries = vec![("no-change write", original)];
+    let mut offset = OcMailbox::decode(original);
+    offset.offset_volts = -0.005;
+    offset.override_mode = false;
+    offset.target_volts = 0.0;
+    tries.push(("-5 mV offset", OcMailbox::encode(&offset)));
+    for (label, word) in tries {
+        let answer = mb.execute(OcMailbox::CMD_WRITE_VF, 0, 0, word);
+        let after = read();
+        out!("{label}: wrote 0x{word:08X}, status {:?}, reads {:?}", answer.as_ref().map(|a| a.0), after.as_ref().map(|a| format!("0x{:08X}", a.1)));
+        if let Ok((_, now)) = after {
+            if now != original {
+                let back = mb.execute(OcMailbox::CMD_WRITE_VF, 0, 0, original);
+                out!("  restore: status {:?}, reads {:?}", back.map(|a| a.0), read().map(|a| format!("0x{:08X}", a.1)));
+            }
+        }
+    }
+    0
+}
+
 /// Lists the switches.
 fn help() -> i32 {
     out!(
@@ -1305,6 +1352,8 @@ the current directory on Linux.
 Reporting
   --probe [file]        hardware readings and current settings; no tuning writes.
   --intel-audit [file]  per-thread Intel register and mailbox readings.
+  --core-offset-probe   the core domain's raw answers to a no-change write and to -5 mV,
+                        each read back and put back. For telling a lock from a busy CPU.
   --mailbox-scan [file] every OC mailbox domain and the ratio MSRs on every core, raw;
                         read commands only. For mapping a CPU generation this has not seen.
   --asus-audit         ASUS control metadata and measured clocks; no tuning writes.

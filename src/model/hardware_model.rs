@@ -160,9 +160,6 @@ pub struct HardwareModel {
     driver_status: Mutex<String>,
     smbus_status: Mutex<String>,
     mailbox_available: AtomicBool,
-    /// Voltage domains whose writes the CPU refuses, with the status it gave (Arrow Lake only:
-    /// probed once at start-up with a no-change write).
-    refused_domains: Mutex<HashMap<i32, u8>>,
     voltage_access_restriction: Mutex<Option<String>>,
     /// True when the BIOS left the core domain in mailbox Override mode (fixed VID).
     bios_core_override: AtomicBool,
@@ -250,7 +247,6 @@ impl HardwareModel {
             driver_status: Mutex::new("not loaded".into()),
             smbus_status: Mutex::new("not probed".into()),
             mailbox_available: AtomicBool::new(false),
-            refused_domains: Mutex::new(HashMap::new()),
             voltage_access_restriction: Mutex::new(None),
             bios_core_override: AtomicBool::new(false),
             oc_locked: AtomicBool::new(false),
@@ -655,9 +651,6 @@ impl HardwareModel {
                         .unwrap_or_else(|| "OC mailbox (MSR 0x150) not responding; FIVR voltage rows disabled.".into()),
                 );
             } else {
-                if cpu.is_arrow_lake() {
-                    self.probe_voltage_domains(&cpu);
-                }
                 match cpu.mailbox().read_domain(OcMailbox::DOMAIN_CORE) {
                     Ok(core) => {
                         self.bios_core_override.store(core.override_mode, Ordering::SeqCst);
@@ -677,31 +670,6 @@ impl HardwareModel {
         })();
         if let Err(e) = r {
             self.emit(&format!("CPU init error: {e}"));
-        }
-    }
-
-    /// Arrow Lake can refuse voltage writes on a domain it reads fine: with the BIOS's Intel
-    /// undervolt protection on, the core domain answers 0x13 to a change and 0x08 even to writing
-    /// its own value back, while SA accepts both. Rows that can only fail are shown read-only
-    /// with the reason instead.
-    fn probe_voltage_domains(&self, cpu: &IntelCpu) {
-        for (domain, name) in [(OcMailbox::DOMAIN_CORE, "CPU core"), (OcMailbox::DOMAIN_SA, "SA")] {
-            match cpu.mailbox().probe_writable(domain) {
-                Ok(Ok(())) => {}
-                Ok(Err(st)) => {
-                    lock(&self.refused_domains).insert(domain, st);
-                    self.emit(&format!(
-                        "{name} voltage: the CPU refuses writes to mailbox domain {domain} ({}). {}",
-                        OcMailbox::describe_status(st),
-                        if domain == OcMailbox::DOMAIN_CORE {
-                            "This is what Intel's undervolt protection does; with it switched off in the BIOS (often \"Undervolt Protection\" under the CPU or power settings), the core voltage rows become writable. Shown read-only until then."
-                        } else {
-                            "Shown read-only."
-                        }
-                    ));
-                }
-                Err(e) => self.emit(&format!("{name} voltage write probe failed: {e}")),
-            }
         }
     }
 
@@ -1023,26 +991,6 @@ impl HardwareModel {
             rows.extend(add_domain("gt", "GT (iGPU)", OcMailbox::DOMAIN_GT, 0.600, 1.520, gt_readable));
         }
 
-        // Domains the CPU was found to refuse writes on (Arrow Lake start-up probe): keep the
-        // readings, drop the write, and say why.
-        let refused = lock(&self.refused_domains).clone();
-        for (prefix, domain) in [("core", OcMailbox::DOMAIN_CORE), ("sa", OcMailbox::DOMAIN_SA)] {
-            let Some(&st) = refused.get(&domain) else { continue };
-            for row in rows.iter_mut().filter(|r| r.id == format!("{prefix}_v") || r.id == format!("{prefix}_off")) {
-                row.write = None;
-                row.restore_default = None;
-                row.note = Some(format!(
-                    "Read-only: the CPU refuses writes to this voltage domain ({}).{}",
-                    OcMailbox::describe_status(st),
-                    if domain == OcMailbox::DOMAIN_CORE {
-                        " That is Intel's undervolt protection; switch it off in the BIOS to change the core voltage from here."
-                    } else {
-                        ""
-                    }
-                ));
-            }
-        }
-
         if let Some(asus) = self.asus_control() {
             let mut add_asus_rail = |prefix: &str, name: &str, id: u32, baseline: Option<SvidState>| {
                 let Some(baseline) = baseline else { return };
@@ -1074,6 +1022,18 @@ impl HardwareModel {
             add_asus_rail("sa", "SA", AsusBoardControl::SA_ID, asus.baseline_sa());
             add_asus_rail("ecore", "CPU E-Core L2", AsusBoardControl::L2_ID, asus.baseline_l2());
             add_asus_rail("ring", "Ring", AsusBoardControl::RING_ID, asus.baseline_ring());
+        }
+
+        // A fixed core voltage does not take on Arrow Lake: a write of override mode with a
+        // 1.310 V target read back as override with target 0 and ratio x55 (the 270K Plus, with
+        // undervolt protection off), so the CPU discards the target in that encoding and the
+        // write is rolled back. The offset works and stays; the fixed target is shown read-only.
+        if arrow_lake && self.asus_control().is_none() {
+            if let Some(row) = rows.iter_mut().find(|r| r.id == "core_v") {
+                row.write = None;
+                row.restore_default = None;
+                row.note = Some("Read-only on Arrow Lake: the CPU discards a fixed core voltage written in this format (it reads back with no target), so only the offset below is offered. Use the BIOS for a fixed Vcore.".into());
+            }
         }
 
         // On LGA1851 the same holds: domain 2 reports the core domain's IccMax, the shared VccIA.
@@ -1957,6 +1917,19 @@ impl HardwareModel {
             ));
             self.core_voltage_ignored.store(false, Ordering::SeqCst);
             return Some(true);
+        }
+        // Arrow Lake's idle Vcore swings by hundreds of millivolts (648 mV of noise against a
+        // 10 mV offset on the 270K Plus), so the board sensor cannot decide a small step either
+        // way. There the CPU's own VID following the request is the answer; say which it was.
+        let arrow_lake = self.cpu().is_some_and(|c| c.is_arrow_lake());
+        let vid_followed = s.id != "core_v" && sign(d_vid) == sign(expected_mv) && d_vid.abs() >= expected_mv.abs() * 0.5;
+        if arrow_lake && vid_followed && noise > expected_mv.abs() * 4.0 {
+            self.emit(&format!(
+                "{}: the CPU's VID moved {d_vid:+.0} mV as asked. The board's Vcore sensor is too noisy at idle ({noise:.0} mV) to show a step this size; check it under a steady load.",
+                s.name
+            ));
+            self.core_voltage_ignored.store(false, Ordering::SeqCst);
+            return None;
         }
         self.core_voltage_ignored.store(true, Ordering::SeqCst);
         self.emit(&format!(

@@ -132,6 +132,8 @@ impl OcMailbox {
     /// bears the table out: its missing E-core L2 domain answers 2 (invalid domain) and its GT
     /// domain, which the mailbox does not reach, answers 5 (OC not supported). The earlier table
     /// here called those "illegal data" and "voltage exceeds limit".
+    pub const STATUS_BUSY: u8 = 0x08;
+
     pub fn describe_status(status: u8) -> String {
         match status {
             0 => "OK".into(),
@@ -142,27 +144,15 @@ impl OcMailbox {
             5 => "overclocking not supported on this domain".into(),
             6 => "write failed".into(),
             7 => "read failed".into(),
+            // Not in the reference table; read off an Arrow Lake. 0x08 comes back while the CPU is
+            // still applying the previous voltage change (the same write 200 ms later is accepted)
+            // and for a write of the all-zero word to a domain that already holds it.
+            Self::STATUS_BUSY => "busy applying the previous change".into(),
+            // Only seen with the BIOS's undervolt protection on, for any change to the core
+            // domain; with it off the same write is accepted.
+            0x13 => "refused by undervolt protection (turn \"Undervolt Protection\" off in the BIOS)".into(),
             _ => format!("status 0x{status:02X}"),
         }
-    }
-
-    /// Whether the CPU accepts writes to a domain at all, found by writing back exactly the word
-    /// it reports, which changes nothing. `Ok(())` when accepted, otherwise the status. On an
-    /// Arrow Lake with the BIOS's undervolt protection on, the core domain refuses even this
-    /// (status 0x08) while SA accepts it.
-    pub fn probe_writable(&self, domain: i32) -> Result<std::result::Result<(), u8>> {
-        let _g = lock(&self.lock);
-        let (st, word) = self.execute_locked(Self::CMD_READ_VF, domain as u8, 0, 0)?;
-        if st != 0 {
-            return Ok(Err(st));
-        }
-        let (st, _) = self.execute_locked(Self::CMD_WRITE_VF, domain as u8, 0, word)?;
-        // Whatever the answer, the domain must still hold what it held.
-        let (_, after) = self.execute_locked(Self::CMD_READ_VF, domain as u8, 0, 0)?;
-        if after != word {
-            bail!("Mailbox domain {domain} changed during a no-change write probe (0x{word:08X} -> 0x{after:08X}).");
-        }
-        Ok(if st == 0 { Ok(()) } else { Err(st) })
     }
 
     pub fn read_domain(&self, domain: i32) -> Result<VfDomainSettings> {
@@ -204,11 +194,32 @@ impl OcMailbox {
         self.write_domain_locked(domain, s)
     }
 
+    /// One VF write, sent again while the CPU answers "busy" (0x08). Arrow Lake gives that for a
+    /// while after a voltage change: putting an offset back to 0 straight after setting it was
+    /// refused, and the same write 200 ms later accepted. Up to about a second.
+    fn write_vf_retrying(&self, domain: i32, word: u32) -> Result<u8> {
+        let mut st = Self::STATUS_BUSY;
+        for attempt in 0..10 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            st = self.execute_locked(Self::CMD_WRITE_VF, domain as u8, 0, word)?.0;
+            if st != Self::STATUS_BUSY {
+                break;
+            }
+            // Writing back what the domain already holds also answers 0x08: nothing to wait for.
+            if Self::encode(&self.read_domain_locked(domain)?) == word {
+                return Ok(0);
+            }
+        }
+        Ok(st)
+    }
+
     fn write_domain_locked(&self, domain: i32, s: &VfDomainSettings) -> Result<()> {
         let before = Self::encode(&self.read_domain_locked(domain)?);
         let requested = Self::encode(s);
         let attempt = (|| -> Result<()> {
-            let (st, _) = self.execute_locked(Self::CMD_WRITE_VF, domain as u8, 0, requested)?;
+            let st = self.write_vf_retrying(domain, requested)?;
             if st != 0 {
                 bail!("Mailbox write to domain {domain} rejected: {}.", Self::describe_status(st));
             }
@@ -222,7 +233,7 @@ impl OcMailbox {
         })();
         if let Err(ex) = attempt {
             let restore = match (|| -> Result<bool> {
-                let (restore_status, _) = self.execute_locked(Self::CMD_WRITE_VF, domain as u8, 0, before)?;
+                let restore_status = self.write_vf_retrying(domain, before)?;
                 Ok(restore_status == 0 && Self::encode(&self.read_domain_locked(domain)?) == before)
             })() {
                 Ok(true) => "Previous mailbox value restored and read back.".to_string(),
@@ -351,22 +362,11 @@ mod tests {
     }
 
     #[test]
-    fn write_probe_changes_nothing_and_reports_acceptance() {
-        let d = FakeDriver::new();
-        let mb = OcMailbox::new(d.clone(), 0);
-        mb.set_override(4, 1.196).unwrap();
-        let before = OcMailbox::encode(&mb.read_domain(4).unwrap());
-        assert_eq!(mb.probe_writable(4).unwrap(), Ok(()));
-        assert_eq!(OcMailbox::encode(&mb.read_domain(4).unwrap()), before);
-        let writes: Vec<u64> = d.state().writes.iter().filter(|w| (w.1 >> 32) & 0xFF == 0x11).map(|w| w.1 as u32 as u64).collect();
-        assert_eq!(writes.last().copied(), Some(before as u64), "the probe must write back exactly the word it read");
-    }
-
-    #[test]
     fn status_codes_are_intels() {
         assert_eq!(OcMailbox::describe_status(2), "invalid domain");
         assert_eq!(OcMailbox::describe_status(5), "overclocking not supported on this domain");
-        assert!(OcMailbox::describe_status(0x13).contains("0x13"));
+        assert!(OcMailbox::describe_status(0x13).contains("Undervolt Protection"));
+        assert!(OcMailbox::describe_status(0x08).contains("busy"));
     }
 
     #[test]
