@@ -5,6 +5,7 @@ mod model;
 mod ui;
 
 mod cli;
+mod write_test;
 
 use std::sync::Arc;
 

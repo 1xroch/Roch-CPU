@@ -128,18 +128,41 @@ impl OcMailbox {
         matches!(self.execute(Self::CMD_READ_VF, Self::DOMAIN_CORE as u8, 0, 0), Ok((0, _)))
     }
 
+    /// The OC mailbox completion codes as Intel's reference firmware names them. Arrow Lake
+    /// bears the table out: its missing E-core L2 domain answers 2 (invalid domain) and its GT
+    /// domain, which the mailbox does not reach, answers 5 (OC not supported). The earlier table
+    /// here called those "illegal data" and "voltage exceeds limit".
     pub fn describe_status(status: u8) -> String {
         match status {
             0 => "OK".into(),
-            1 => "invalid command".into(),
-            2 => "illegal data".into(),
-            3 => "reserved".into(),
-            4 => "ratio exceeds limit".into(),
-            5 => "voltage exceeds limit".into(),
-            6 => "OC locked".into(),
-            7 => "invalid domain".into(),
-            _ => format!("error 0x{status:02X}"),
+            1 => "OC locked".into(),
+            2 => "invalid domain".into(),
+            3 => "ratio exceeds limit".into(),
+            4 => "voltage exceeds limit".into(),
+            5 => "overclocking not supported on this domain".into(),
+            6 => "write failed".into(),
+            7 => "read failed".into(),
+            _ => format!("status 0x{status:02X}"),
         }
+    }
+
+    /// Whether the CPU accepts writes to a domain at all, found by writing back exactly the word
+    /// it reports, which changes nothing. `Ok(())` when accepted, otherwise the status. On an
+    /// Arrow Lake with the BIOS's undervolt protection on, the core domain refuses even this
+    /// (status 0x08) while SA accepts it.
+    pub fn probe_writable(&self, domain: i32) -> Result<std::result::Result<(), u8>> {
+        let _g = lock(&self.lock);
+        let (st, word) = self.execute_locked(Self::CMD_READ_VF, domain as u8, 0, 0)?;
+        if st != 0 {
+            return Ok(Err(st));
+        }
+        let (st, _) = self.execute_locked(Self::CMD_WRITE_VF, domain as u8, 0, word)?;
+        // Whatever the answer, the domain must still hold what it held.
+        let (_, after) = self.execute_locked(Self::CMD_READ_VF, domain as u8, 0, 0)?;
+        if after != word {
+            bail!("Mailbox domain {domain} changed during a no-change write probe (0x{word:08X} -> 0x{after:08X}).");
+        }
+        Ok(if st == 0 { Ok(()) } else { Err(st) })
     }
 
     pub fn read_domain(&self, domain: i32) -> Result<VfDomainSettings> {
@@ -325,6 +348,25 @@ mod tests {
         mb.set_override(0, 1.3).unwrap();
         let actual = mb.read_domain(0).unwrap();
         assert!(actual.override_mode && (actual.target_volts - 1.3).abs() < 1.0 / 1024.0, "Wrong voltage readback");
+    }
+
+    #[test]
+    fn write_probe_changes_nothing_and_reports_acceptance() {
+        let d = FakeDriver::new();
+        let mb = OcMailbox::new(d.clone(), 0);
+        mb.set_override(4, 1.196).unwrap();
+        let before = OcMailbox::encode(&mb.read_domain(4).unwrap());
+        assert_eq!(mb.probe_writable(4).unwrap(), Ok(()));
+        assert_eq!(OcMailbox::encode(&mb.read_domain(4).unwrap()), before);
+        let writes: Vec<u64> = d.state().writes.iter().filter(|w| (w.1 >> 32) & 0xFF == 0x11).map(|w| w.1 as u32 as u64).collect();
+        assert_eq!(writes.last().copied(), Some(before as u64), "the probe must write back exactly the word it read");
+    }
+
+    #[test]
+    fn status_codes_are_intels() {
+        assert_eq!(OcMailbox::describe_status(2), "invalid domain");
+        assert_eq!(OcMailbox::describe_status(5), "overclocking not supported on this domain");
+        assert!(OcMailbox::describe_status(0x13).contains("0x13"));
     }
 
     #[test]

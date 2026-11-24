@@ -60,5 +60,35 @@ What changed for Arrow Lake:
 - IccMax is read as the 11-bit field it is; ten bits wrapped 347 A to 91 A.
 - The MSI EC's core regulator, clock generator and VDD2 controls stay off on LGA1851 until an 800-series board is mapped.
 - On the Z890 AORUS TACHYON ICE the ITE IT8696E's Vcore, VNNAON and VCCSA inputs are named, from Roch Viewer's confirmed map.
+- The OC mailbox status codes are Intel's: Arrow Lake answers 2 (invalid domain) for the missing E-core L2 domain and 5 (not supported) for GT.
+- At start-up each voltage domain is checked with a write of its own value, which changes nothing. A domain that refuses it is shown read-only with the reason, instead of rows that always fail.
 
-Writes on Arrow Lake go through the same mailbox and MSR paths that were validated on Raptor Lake, with the same read-back and rollback. Writes have not yet been checked against measured rails on Arrow Lake, so change one setting at a time.
+### Write test
+
+`sudo roch-cpu --write-test` (or the same through `pkexec`) writes every Intel row a small step, measures the effect with something other than the register it wrote, and then writes back a raw snapshot of every register it could have touched and reads it all again. On the 270K Plus above, Linux, 2026-11-23:
+
+| Row | Change | Measured | Result |
+| --- | --- | --- | --- |
+| CPU Ratio (P-Core) | x54 → x52 | all P-cores busy ran x52 | pass |
+| Per-core P ratio | core 0 x50, others x54 | core 0 ran x50, core 1 x54 | pass |
+| E-Core Ratio | x47 → x45 | all E-cores busy ran x45 | pass |
+| Per-cluster E ratio | cluster 0 x44 | cluster 0 ran x44, cluster 1 x47 | pass |
+| Ring Ratio | x40 → x38 | MSR 0x621 under load x38 | pass |
+| PL1 / PL2 | 250 → 240 W | the kernel's RAPL powercap reads 240 W | pass |
+| SA Voltage | 1.196 → 1.205 V | read back; the board's VCCSA input did not move a 12 mV step | pass |
+| SA offset while SA is fixed | -5 mV | refused, SA kept fixed | pass |
+| DIMM VDD / VDDQ / VPP, both DIMMs | +15 mV | each PMIC's ADC moved 10-15 mV | pass |
+| CPU Core Voltage and offset | -10 mV / fixed | refused by the CPU: 0x13 to a change, 0x08 to a no-change write | read-only |
+| Restore | | every register back to its start value | pass |
+
+The core domain refusing writes while SA accepts them is what Intel's undervolt protection looks like; with it off in the BIOS the core rows become writable. The kernel logged "Write to unrecognized MSR ... tainting CPU_OUT_OF_SPEC" for the MSR writes, as expected.
+
+### D2D and NGU
+
+Arrow Lake has two more fabric clocks: D2D, the die-to-die link between the compute and SoC tiles (30x on 200S Plus, 21x on the original 200S), and NGU, the SoC tile's network on chip (26-28x), on VnnAON and VccSA respectively. Neither is offered here:
+
+- D2D "can only be set at boot and cannot be changed in the operating system" (SkatterBencher), and HWiNFO's author reports that the interface for reading it is locked.
+- No documented register sets or reports NGU at runtime.
+- Mailbox domain 7 reads ratio x21 on this CPU and nothing else. That is the original Arrow Lake D2D default, not this CPU's 30x, so it is not assumed to be D2D. Changing D2D or NGU in the BIOS and comparing `--mailbox-scan` before and after would show whether it follows either.
+
+Writes on Arrow Lake go through the same mailbox and MSR paths as on Raptor Lake, with the same read-back and rollback, and were checked on hardware as above. Read-back and a short load test do not prove a setting is stable: change one at a time.

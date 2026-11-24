@@ -133,6 +133,9 @@ pub fn run(args: &[String]) -> i32 {
     if eq(a0, "--probe") {
         return probe(&arg_or(args, 1, dir.join("probe.txt")));
     }
+    if eq(a0, "--write-test") {
+        return crate::write_test::run(&arg_or(args, 1, dir.join("write-test.txt")));
+    }
     if eq(a0, "--mailbox-scan") {
         return mailbox_scan(&arg_or(args, 1, dir.join("mailbox-scan.txt")));
     }
@@ -1314,6 +1317,9 @@ Reporting
   --help                this list.
 
 Checking a control that seems to do nothing
+  --write-test [file]   write every Intel row a small step, measure the effect (clocks under
+                        load, the kernel's RAPL view, the board and PMIC sensors), then put
+                        every register back exactly as found and prove it. Close the window first.
   --asus-voltage-validate  test ASUS Manual SVID at 1.275/1.300 V, then restore.
   --asus-bclk-validate     test nominal 101 MHz in measured steps, then restore.
   --asus-rail-validate sa|l2 volts  test the selected ASUS voltage and sensor response, then restore.
