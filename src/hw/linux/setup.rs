@@ -1,16 +1,19 @@
 //! `rochcpu setup`: stop asking for the password at every launch.
 //!
 //! Without it the window starts its root helper through `pkexec`, and the desktop asks for a
-//! password each time, as UAC does on Windows. Setup puts a root-owned copy of this program at
-//! [`INSTALLED`] and a polkit rule that lets the person who ran it start exactly that copy, with
-//! exactly the helper argument, from their own active session, without a password. A copy in
-//! `~/.local/bin` could not be trusted that way: anything running as you can replace a file there,
-//! so a rule naming it would hand out root. Nobody but root can change the copy here.
+//! password each time, as UAC does on Windows. Setup writes a polkit rule that lets the person who
+//! ran it start exactly one program, with exactly the helper argument, from their own active
+//! session, without a password. The program has to be one nobody but root can change, or the rule
+//! would hand out root:
+//!
+//! * installed by a package (`/usr/bin/rochcpu`): it already is, so the rule names it, and an
+//!   update that replaces it in place keeps working with no setup to repeat;
+//! * anywhere else (`~/.local/bin`, where anything running as you could replace it): setup copies
+//!   it to [`INSTALLED`], root-owned, and the rule names the copy. The window uses the copy only
+//!   while it is this same build, so after an update it asks again until setup is run again.
 //!
 //! The trade: anything running as you can then start the helper silently and do what it allows
 //! (see `direct`'s allowlists): change CPU ratios, voltages and power limits, and the DIMM rails.
-//! The window uses the installed copy only while it is this same build, so after an update it asks
-//! again until setup is run again.
 
 use std::ffi::CStr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
@@ -18,9 +21,9 @@ use std::path::{Path, PathBuf};
 
 use super::HELPER_ARG;
 
-/// The root-owned copy setup installs.
+/// The root-owned copy setup installs for a program that is not already root-owned.
 pub const INSTALLED: &str = "/usr/local/bin/rochcpu";
-/// The polkit rule that lets its owner start [`INSTALLED`] as the helper without a password.
+/// The polkit rule that lets its owner start the helper without a password.
 pub const RULE_FILE: &str = "/etc/polkit-1/rules.d/49-rochcpu.rules";
 
 const USAGE: &str = "\
@@ -30,18 +33,32 @@ rochcpu setup --show     what setup would change, without changing it
 rochcpu setup --undo     remove it (with sudo), so every launch asks again
 ";
 
-/// The program to hand `pkexec`: the installed copy while it is this very build, otherwise this
-/// executable, which brings the password prompt back rather than run an older helper.
+/// The program to hand `pkexec`: this one when nobody but root can change it (a package install),
+/// else the installed copy while it is this very build, else this executable, which brings the
+/// password prompt back rather than run an older helper.
 pub fn helper_program() -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    Ok(if installed_matches(&exe) {
-        PathBuf::from(INSTALLED)
-    } else {
+    Ok(if root_protected(&exe) || !installed_matches(&exe) {
         exe
+    } else {
+        PathBuf::from(INSTALLED)
     })
 }
 
-/// Root-owned, writable by nobody else, and byte for byte the running program.
+/// Root-owned and writable by nobody else: the file, and every folder above it, since whoever can
+/// write a folder can swap the file inside it.
+fn root_protected(path: &Path) -> bool {
+    let safe = |meta: &std::fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() && safe(&meta) => {}
+        _ => return false,
+    }
+    path.ancestors()
+        .skip(1)
+        .all(|folder| folder.as_os_str().is_empty() || std::fs::metadata(folder).is_ok_and(|meta| safe(&meta)))
+}
+
+/// The copy is root-owned, writable by nobody else, and byte for byte the running program.
 fn installed_matches(exe: &Path) -> bool {
     let installed = Path::new(INSTALLED);
     let Ok(meta) = std::fs::metadata(installed) else {
@@ -122,15 +139,20 @@ fn plain_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-fn rule_text(user: &str) -> String {
+/// A path as it can go into the rule as a plain string.
+fn plain_path(path: &str) -> bool {
+    path.starts_with('/') && !path.bytes().any(|b| b == b'"' || b == b'\\' || b.is_ascii_control())
+}
+
+fn rule_text(user: &str, program: &str) -> String {
     format!(
         "// Written by `rochcpu setup` for {user}; `sudo rochcpu setup --undo` removes it.\n\
-         // Lets {user} start Roch CPU's root helper without a password: only the root-owned copy at\n\
-         // {INSTALLED}, only with {HELPER_ARG}, and only from an active local session.\n\
+         // Lets {user} start Roch CPU's root helper without a password: only {program}, which\n\
+         // nobody but root can change, only with {HELPER_ARG}, and only from an active local session.\n\
          polkit.addRule(function (action, subject) {{\n\
          \x20   if (action.id == \"org.freedesktop.policykit.exec\" &&\n\
-         \x20       action.lookup(\"program\") == \"{INSTALLED}\" &&\n\
-         \x20       action.lookup(\"command_line\") == \"{INSTALLED} {HELPER_ARG}\" &&\n\
+         \x20       action.lookup(\"program\") == \"{program}\" &&\n\
+         \x20       action.lookup(\"command_line\") == \"{program} {HELPER_ARG}\" &&\n\
          \x20       subject.user == \"{user}\" && subject.local && subject.active) {{\n\
          \x20       return polkit.Result.YES;\n\
          \x20   }}\n\
@@ -140,9 +162,15 @@ fn rule_text(user: &str) -> String {
 
 fn show() -> i32 {
     println!("Setup would:");
-    println!("  copy this program to {INSTALLED}, owned by root and writable only by root");
+    match std::env::current_exe() {
+        Ok(exe) if root_protected(&exe) => println!(
+            "  leave this program where it is: {} is root-owned, so the rule can name it",
+            exe.display()
+        ),
+        _ => println!("  copy this program to {INSTALLED}, owned by root and writable only by root"),
+    }
     println!(
-        "  write {RULE_FILE}, letting you start that copy as the helper ({HELPER_ARG}) without a password"
+        "  write {RULE_FILE}, letting you start that program as the helper ({HELPER_ARG}) without a password"
     );
     println!("Anything running as you could then change CPU and DIMM settings without asking.");
     0
@@ -159,13 +187,16 @@ fn install() -> i32 {
         return 1;
     };
     match install_files(&user) {
-        Ok(()) => {
-            println!(
-                "Installed {INSTALLED} and {RULE_FILE}. Roch CPU will no longer ask {user} for a password."
-            );
-            println!(
-                "Run it again after updating Roch CPU; `sudo rochcpu setup --undo` removes it."
-            );
+        Ok((program, copied)) => {
+            println!("Wrote {RULE_FILE}. Roch CPU will no longer ask {user} for a password.");
+            if copied {
+                println!(
+                    "It names the copy at {program}: run setup again after updating Roch CPU."
+                );
+            } else {
+                println!("It names {program}, so an update installed in its place keeps working.");
+            }
+            println!("`sudo rochcpu setup --undo` removes it.");
             0
         }
         Err(error) => {
@@ -199,14 +230,27 @@ fn put(target: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     result
 }
 
-fn install_files(user: &str) -> Result<(), String> {
+/// The program the rule names, and whether it had to be copied there.
+fn install_files(user: &str) -> Result<(String, bool), String> {
     let exe = std::env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
-    let program = std::fs::read(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
-    put(Path::new(INSTALLED), &program, 0o755)?;
-    put(Path::new(RULE_FILE), rule_text(user).as_bytes(), 0o644)
+    let (program, copied) = if root_protected(&exe) {
+        // A package's copy: a stale one setup made earlier would only confuse, so it goes.
+        let _ = std::fs::remove_file(INSTALLED);
+        (exe.display().to_string(), false)
+    } else {
+        let bytes = std::fs::read(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+        put(Path::new(INSTALLED), &bytes, 0o755)?;
+        (INSTALLED.to_string(), true)
+    };
+    if !plain_path(&program) {
+        return Err(format!("{program} cannot be named in a polkit rule"));
+    }
+    put(Path::new(RULE_FILE), rule_text(user, &program).as_bytes(), 0o644)?;
+    Ok((program, copied))
 }
 
 fn status() -> i32 {
+    let exe = std::env::current_exe().unwrap_or_default();
     let installed = Path::new(INSTALLED).exists();
     // The rules folder is readable only by root and polkit, so as yourself the rule cannot be seen.
     let rule = match std::fs::metadata(RULE_FILE) {
@@ -214,6 +258,18 @@ fn status() -> i32 {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
         Err(_) => None,
     };
+    if root_protected(&exe) {
+        match rule {
+            Some(true) => println!("Set up: {RULE_FILE} is in place."),
+            Some(false) => println!("Not set up: it asks for a password each time. Run `sudo rochcpu setup`."),
+            None => println!("{RULE_FILE} is readable only by root; `sudo rochcpu setup --status` shows it."),
+        }
+        println!(
+            "{} is root-owned, so with the rule in place it starts without asking, updates included.",
+            exe.display()
+        );
+        return 0;
+    }
     match (installed, rule) {
         (false, Some(false)) => println!("Not set up: it asks for a password each time."),
         (true, Some(true)) => println!("Set up: {INSTALLED} and {RULE_FILE} are in place."),
@@ -222,7 +278,6 @@ fn status() -> i32 {
         (true, Some(false)) => println!("Partly set up: {RULE_FILE} is missing. Run `sudo rochcpu setup` again."),
     }
     if installed {
-        let exe = std::env::current_exe().unwrap_or_default();
         if installed_matches(&exe) {
             println!("This build matches the installed copy, so it starts without asking.");
         } else {
@@ -258,18 +313,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_rule_names_only_the_installed_helper_for_one_user() {
-        let rule = rule_text("local");
+    fn the_rule_names_only_one_program_for_one_user() {
+        let rule = rule_text("local", "/usr/bin/rochcpu");
         assert!(rule.contains(
-            "action.lookup(\"command_line\") == \"/usr/local/bin/rochcpu --hardware-helper\""
+            "action.lookup(\"command_line\") == \"/usr/bin/rochcpu --hardware-helper\""
         ));
+        assert!(rule.contains("action.lookup(\"program\") == \"/usr/bin/rochcpu\""));
         assert!(rule.contains("subject.user == \"local\" && subject.local && subject.active"));
         assert!(!rule.contains(".local/bin"));
     }
 
     #[test]
-    fn only_plain_user_names_go_into_the_rule() {
+    fn only_plain_names_and_paths_go_into_the_rule() {
         assert!(plain_name("local") && plain_name("first.last") && plain_name("a_b-1"));
         assert!(!plain_name("") && !plain_name("x\" || true || \"") && !plain_name("a b"));
+        assert!(plain_path("/usr/bin/rochcpu") && !plain_path("bin/rochcpu") && !plain_path("/a\"b"));
+    }
+
+    #[test]
+    fn a_package_install_is_protected_and_a_home_install_is_not() {
+        // /usr/bin/sh is root-owned in root-owned folders on any Linux this runs on.
+        assert!(root_protected(Path::new("/usr/bin/sh")) || !Path::new("/usr/bin/sh").exists());
+        let home = std::env::temp_dir().join(format!("rochcpu-setup-test-{}", std::process::id()));
+        std::fs::write(&home, b"x").unwrap();
+        assert!(!root_protected(&home));
+        let _ = std::fs::remove_file(home);
     }
 }
