@@ -1,0 +1,27 @@
+# This only prints. `rochcpu setup` lets one user start Roch CPU's root helper without a password,
+# so whoever installs this runs it themselves, and removing the package leaves what they did in place.
+
+post_install() {
+  cat <<'END'
+Roch CPU asks for your password through pkexec each time the window starts. To stop that, once:
+  sudo rochcpu setup
+Installed from this package, setup names /usr/bin/rochcpu itself, so updates keep it working.
+END
+}
+
+post_upgrade() {
+  # A setup made from a home install named a copy in /usr/local/bin, not this package's program.
+  if [ -e /usr/local/bin/rochcpu ]; then
+    echo "Run 'sudo rochcpu setup' once more so the password-free helper is this package's rochcpu."
+  fi
+  return 0
+}
+
+post_remove() {
+  local rule=/etc/polkit-1/rules.d/49-rochcpu.rules
+  if [ -e "$rule" ]; then
+    echo "Still in place: $rule. It names a program that is gone, so it no longer does anything."
+    echo "To remove it: sudo rm $rule"
+  fi
+  return 0
+}

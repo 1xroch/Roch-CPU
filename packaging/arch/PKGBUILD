@@ -1,0 +1,42 @@
+# Maintainer: Roch Studio <300260898+1xroch@users.noreply.github.com>
+
+# Installs the binary published with a release: nothing is compiled, so no Rust toolchain is needed.
+# It never runs `rochcpu setup`: letting a user change the CPU without a password stays their step.
+
+pkgname=roch-cpu-bin
+pkgver=1.0.9
+pkgrel=1
+pkgdesc='CPU and memory tuning: ratios, voltages, power limits and DDR5 rails for Intel and AMD'
+arch=(x86_64)
+url='https://github.com/1xroch/Roch-CPU'
+license=(GPL-3.0-only)
+depends=(glibc libgcc hicolor-icon-theme polkit)
+optdepends=(
+  'libglvnd: the window'
+  'libxkbcommon: the window'
+  'wayland: the window on Wayland'
+  'libx11: the window on X11'
+  'libxcursor: the window on X11'
+  'libxi: the window on X11'
+  'libxkbcommon-x11: the window on X11'
+  'fontconfig: the system fonts'
+  'xdg-utils: opening links from the window'
+)
+provides=(roch-cpu)
+conflicts=(roch-cpu)
+# Already stripped, and left alone so /usr/bin/rochcpu matches the release's SHA256SUMS.txt.
+options=(!debug !strip)
+install=roch-cpu.install
+_dir="Roch-CPU-$pkgver-linux-x86_64"
+source=("$_dir.tar.gz::$url/releases/download/v$pkgver/$_dir.tar.gz")
+sha256sums=('c4ad9d51fe4d17c10c589bc3d343a6070f12cfeaee0784675786bcabe0166eee')
+
+package() {
+  cd "$_dir"
+  install -Dm755 rochcpu "$pkgdir/usr/bin/rochcpu"
+  # The entry's name is the Wayland app id, which is how a compositor finds a running window's icon.
+  install -Dm644 RochCPU.desktop "$pkgdir/usr/share/applications/RochCPU.desktop"
+  install -Dm644 RochCPU.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/RochCPU.png"
+  install -Dm644 THIRD-PARTY-NOTICES.md "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.md"
+  install -Dm644 -t "$pkgdir/usr/share/doc/roch-cpu" docs/*.md
+}
