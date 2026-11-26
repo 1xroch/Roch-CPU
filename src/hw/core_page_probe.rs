@@ -10,6 +10,11 @@ pub trait CorePageProbeTransport {
     fn read_mode(&self) -> Result<Option<u16>>;
     fn read_target(&self) -> Result<Option<u16>>;
     fn read_secondary_target(&self) -> Result<Option<u16>>;
+    /// PMBus VOUT_MODE (0x20). Read only when every core register reads zero, to tell a regulator
+    /// in adaptive mode from an address nothing answers at. `None` when the transport cannot say.
+    fn read_vout_mode(&self) -> Result<Option<u8>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +130,16 @@ pub fn verify(
         if transport.read_page()? != Some(0) {
             bail!("Regulator PAGE changed while reading core registers.");
         }
+        // MSI's EC bridge reports no NAK: an address with no device behind it reads 0x00 in every
+        // register (the PRO Z790-P DDR4 does this at 0xC6, and writes there never read back). An
+        // all-zero core page is also what a real regulator in adaptive mode shows, so ask the
+        // register every PMBus regulator fills in. A real VOUT_MODE is never 0.
+        if snap == CorePageSnapshot::new(0, 0, 0) && page == 0 && transport.read_vout_mode()? == Some(0) {
+            bail!(
+                "No core regulator answers at EC-I2C 0xC6: PAGE, mode, both targets and VOUT_MODE all read 0. \
+                 CPU Core Voltage stays disabled on this board."
+            );
+        }
         validate_snapshot(&snap)
     })();
     if let Err(ex) = body {
@@ -232,6 +247,7 @@ mod tests {
         writes: RefCell<Vec<u8>>,
         page_reads: Cell<i32>,
         failing_page_reads: RefCell<HashMap<i32, bool>>,
+        vout_mode: Option<u8>,
     }
 
     impl Default for FakeTransport {
@@ -260,6 +276,7 @@ mod tests {
                 writes: RefCell::new(Vec::new()),
                 page_reads: Cell::new(0),
                 failing_page_reads: RefCell::new(HashMap::new()),
+                vout_mode: None,
             }
         }
     }
@@ -340,6 +357,10 @@ mod tests {
         }
         fn read_secondary_target(&self) -> Result<Option<u16>> {
             self.read_core(2, self.secondary)
+        }
+        fn read_vout_mode(&self) -> Result<Option<u8>> {
+            self.access()?;
+            Ok(self.vout_mode)
         }
     }
 
@@ -447,6 +468,21 @@ mod tests {
         let r = run(&io);
         let s = r.snapshot.unwrap();
         check(r.succeeded && s.programmed_target_volts() == 0.0 && s.override_target_volts().is_none(), &r.status);
+    }
+
+    #[test]
+    fn adaptive_zero_with_a_real_vout_mode_still_activates() {
+        let io = FakeTransport { page: Cell::new(0), mode: 0, target: 0, vout_mode: Some(0x40), ..Default::default() };
+        let r = run(&io);
+        check(r.succeeded, &r.status);
+    }
+
+    #[test]
+    fn an_address_that_reads_zero_everywhere_is_not_a_regulator() {
+        // MSI PRO Z790-P WIFI DDR4: nothing at 0xC6, and the EC bridge returns 0x00 for every register.
+        let io = FakeTransport { page: Cell::new(0), mode: 0, target: 0, vout_mode: Some(0), ..Default::default() };
+        let r = run(&io);
+        check(!r.succeeded && r.status.contains("No core regulator") && io.writes().is_empty(), &r.status);
     }
 
     #[test]

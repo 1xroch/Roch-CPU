@@ -180,6 +180,13 @@ impl BclkController {
             self.set_status("clock generator did not answer");
             return Ok(false);
         };
+        // MSI's EC bridge reports no NAK, so an address with nothing behind it reads all zeros
+        // (the PRO Z790-P DDR4 does this). A zero divider is no clock; establish_scale would
+        // refuse it anyway, but then the row offered a control that could never work.
+        if block.iter().all(|&b| b == 0) {
+            self.set_status(format!("no clock generator answers (every register reads 0) at {mhz:.3} MHz"));
+            return Ok(false);
+        }
         let mut s = native::lock(&self.state);
         s.status = format!("baseline {} at {mhz:.3} MHz", EcClockGen::describe(&block));
         s.baseline = Some(block);

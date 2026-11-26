@@ -46,8 +46,20 @@ fn arg_or(args: &[String], i: usize, default: PathBuf) -> PathBuf {
     args.get(i).map(PathBuf::from).unwrap_or(default)
 }
 
+/// Writes a report and says where, once per file: several switches print nothing else, and a
+/// report that lands silently beside the program looks like a switch that did nothing.
 fn write_file(path: &Path, text: &str) {
-    let _ = std::fs::write(path, text);
+    static ANNOUNCED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+    match std::fs::write(path, text) {
+        Ok(()) => {
+            let mut seen = ANNOUNCED.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.iter().any(|p| p == path) {
+                seen.push(path.to_path_buf());
+                out!("Written to {}", path.display());
+            }
+        }
+        Err(e) => err!("Could not write {}: {e}", path.display()),
+    }
 }
 
 fn append_file(path: &Path, text: &str) {
@@ -1293,7 +1305,6 @@ fn mailbox_scan(report_path: &Path) -> i32 {
         w(format!("  uncore: min {} max {} initial max {}", read(format!("{u}/min_freq_khz")), read(format!("{u}/max_freq_khz")), read(format!("{u}/initial_max_freq_khz"))));
     }
     write_file(report_path, &text);
-    out!("Written to {}", report_path.display());
     0
 }
 

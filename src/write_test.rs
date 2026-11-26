@@ -248,6 +248,29 @@ fn apply(r: &mut Report, hw: &HardwareModel, id: &str, value: f64) -> bool {
     ok
 }
 
+/// Whether something other than the row's own read sees the new power limit: the kernel's RAPL
+/// driver on Linux. Windows has no such view, so there the register itself is the evidence.
+fn power_limit_seen(r: &mut Report, cpu: &IntelCpu, constraint: u32, target: f64) {
+    if cfg!(target_os = "linux") {
+        let kernel = powercap_watts(constraint);
+        r.check(
+            "the kernel's RAPL driver sees it",
+            kernel.is_some_and(|k| (k - target).abs() < 0.5),
+            format!("asked {target} W, powercap constraint_{constraint} reads {}", kernel.map_or("n/a".into(), |k| format!("{k} W"))),
+        );
+    } else {
+        let held = cpu.read_package_power_limits().ok().map(|p| if constraint == 0 { p.pl1 } else { p.pl2 });
+        r.check(
+            "MSR 0x610 holds it",
+            held.is_some_and(|w| (w - target).abs() < 0.5),
+            format!(
+                "asked {target} W, MSR 0x610 reads {} (Windows has no independent RAPL view)",
+                held.map_or("n/a".into(), |w| format!("{w} W"))
+            ),
+        );
+    }
+}
+
 fn powercap_watts(constraint: u32) -> Option<f64> {
     std::fs::read_to_string(format!("/sys/class/powercap/intel-rapl:0/constraint_{constraint}_power_limit_uw"))
         .ok()?
@@ -369,8 +392,10 @@ fn tests(r: &mut Report, hw: &HardwareModel, cpu: &Arc<IntelCpu>, dimms: &[Arc<D
     if apply(r, hw, "cpu_ratio", target as f64) {
         let l = under_load(cpu, &p_threads, &p_threads);
         r.check("P-cores run at the new ratio", l.ratio == target, format!("asked x{target}, all P-cores busy ran at x{}", l.ratio));
-        let kernel_max = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq").unwrap_or_default();
-        r.line(format!("    (kernel scaling_max_freq on cpu0: {} kHz; the kernel caches HWP limits)", kernel_max.trim()));
+        if cfg!(target_os = "linux") {
+            let kernel_max = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq").unwrap_or_default();
+            r.line(format!("    (kernel scaling_max_freq on cpu0: {} kHz; the kernel caches HWP limits)", kernel_max.trim()));
+        }
     } else {
         r.check("P-core ratio accepted", false, "refused");
     }
@@ -458,12 +483,7 @@ fn tests(r: &mut Report, hw: &HardwareModel, cpu: &Arc<IntelCpu>, dimms: &[Arc<D
         let start = row(hw, id).ok_or_else(|| anyhow!("{id} unreadable"))?;
         let target = (start - 10.0).max(65.0);
         if apply(r, hw, id, target) {
-            let kernel = powercap_watts(constraint);
-            r.check(
-                "the kernel's RAPL driver sees it",
-                kernel.is_some_and(|k| (k - target).abs() < 0.5),
-                format!("asked {target} W, powercap constraint_{constraint} reads {}", kernel.map_or("n/a".into(), |k| format!("{k} W"))),
-            );
+            power_limit_seen(r, cpu, constraint, target);
         } else {
             r.check(&format!("{id} accepted"), false, "refused");
         }
@@ -487,6 +507,16 @@ fn tests(r: &mut Report, hw: &HardwareModel, cpu: &Arc<IntelCpu>, dimms: &[Arc<D
         let refused = !hw.apply("core_off", -10.0);
         let unchanged = cpu.mailbox().read_domain(OcMailbox::DOMAIN_CORE).is_ok_and(|d| d.offset_volts == 0.0);
         r.check("a read-only core row writes nothing", refused && unchanged, format!("refused {refused}, domain unchanged {unchanged}"));
+    } else if cpu.mailbox().read_domain(OcMailbox::DOMAIN_CORE).is_ok_and(|d| d.override_mode) {
+        // The BIOS holds a fixed core voltage, and an offset would quietly switch it to adaptive.
+        // The row must refuse, as SA's does below.
+        let refused = !hw.apply("core_off", -10.0);
+        let still_fixed = cpu.mailbox().read_domain(OcMailbox::DOMAIN_CORE).is_ok_and(|d| d.override_mode);
+        r.check(
+            "offset refused while the core voltage is fixed",
+            refused && still_fixed,
+            format!("refused {refused}, override kept {still_fixed}"),
+        );
     } else if apply(r, hw, "core_off", -10.0) {
         let after = under_load(cpu, &p_threads, &p_threads);
         let delta = (after.vid - before.vid) * 1000.0;
@@ -538,11 +568,13 @@ fn tests(r: &mut Report, hw: &HardwareModel, cpu: &Arc<IntelCpu>, dimms: &[Arc<D
     r.line("");
     r.line("SA Voltage:");
     if let Some(start) = row(hw, "sa_v") {
-        let sa_before = rail(6);
+        // The board's own VCCSA input: 5 on MSI's EC Nuvoton, 6 on the Z890 AORUS's ITE.
+        let sa_channel = sio.as_ref().and_then(|s| s.sa_channel());
+        let sa_before = sa_channel.and_then(&rail);
         let target = start + 0.009;
         if apply(r, hw, "sa_v", target) {
             std::thread::sleep(Duration::from_millis(300));
-            let sa_after = rail(6);
+            let sa_after = sa_channel.and_then(&rail);
             r.check("SA target reads back", row(hw, "sa_v").is_some_and(|v| (v - target).abs() < 0.002), format!("asked {target:.3} V"));
             match (sa_before, sa_after) {
                 (Some(a), Some(b)) => r.note("board VCCSA sensor", format!("{a:.3} -> {b:.3} V ({:+.0} mV; sensor steps are 12 mV)", (b - a) * 1000.0)),

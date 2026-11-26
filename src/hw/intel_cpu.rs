@@ -841,7 +841,7 @@ impl IntelCpu {
     }
 
     // ------------------------------------------------------------- power limits
-    fn power_unit(&self) -> Result<f64> {
+    pub fn power_unit(&self) -> Result<f64> {
         let u = self.read_or_throw(Self::MSR_RAPL_POWER_UNIT, self.first_p_thread)?;
         Ok(1.0 / (1i32 << (u & 0xF)) as f64)
     }
@@ -867,11 +867,12 @@ impl IntelCpu {
             bail!("Package power limits are locked by the BIOS (MSR 0x610 bit 63).");
         }
         if let Some(p1) = pl1 {
-            let raw = ((p1 / unit).round_ties_even() as u64) & 0x7FFF;
+            // Clamp, never mask: 4096 W at 1/8 W is 0x8000, which a mask turns into 0 W.
+            let raw = power_limit_raw(p1, unit);
             v = (v & !0x7FFFu64) | raw | (1u64 << 15);
         }
         if let Some(p2) = pl2 {
-            let raw = ((p2 / unit).round_ties_even() as u64) & 0x7FFF;
+            let raw = power_limit_raw(p2, unit);
             v = (v & !(0x7FFFu64 << 32)) | (raw << 32) | (1u64 << 47);
         }
         self.write_verified(Self::MSR_PKG_POWER_LIMIT, v, self.first_p_thread)
@@ -1001,11 +1002,25 @@ pub(crate) mod fakes {
     }
 }
 
+/// MSR 0x610's 15-bit power field for `watts`, clamped to the field rather than masked into it.
+fn power_limit_raw(watts: f64, unit: f64) -> u64 {
+    ((watts / unit).round_ties_even().max(0.0) as u64).min(0x7FFF)
+}
+
 #[cfg(test)]
 mod tests {
     use super::fakes::FakeDriver;
     use super::*;
     use crate::hw::oc_mailbox::VfDomainSettings;
+
+    #[test]
+    fn power_limit_field_clamps_instead_of_wrapping() {
+        // 4096 W in 1/8 W units is 0x8000; masked it would have become 0 W.
+        assert_eq!(power_limit_raw(4096.0, 0.125), 0x7FFF);
+        assert_eq!(power_limit_raw(4095.875, 0.125), 0x7FFF);
+        assert_eq!(power_limit_raw(253.0, 0.125), 2024);
+        assert_eq!(power_limit_raw(-1.0, 0.125), 0);
+    }
 
     fn cpu(d: &Arc<FakeDriver>) -> IntelCpu {
         IntelCpu::with_topology(d.clone(), vec![LogicalCpu::new(0, 0, 0, true), LogicalCpu::new(1, 2, 1, false)])

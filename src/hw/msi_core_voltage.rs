@@ -18,6 +18,7 @@ const R_PAGE: u8 = 0x00;
 const R_VOUT_COMMAND: u8 = 0x21;
 const R_VOUT_SECONDARY: u8 = 0x23;
 const R_MODE: u8 = 0xF0;
+const R_VOUT_MODE: u8 = 0x20;
 const MODE_MASK: u16 = 0x0030;
 const MODE_OVERRIDE: u16 = 0x0030;
 
@@ -641,6 +642,9 @@ impl CorePageProbeTransport for ProbeTransport<'_> {
     }
     fn read_secondary_target(&self) -> Result<Option<u16>> {
         self.mailbox.read_word(ADDRESS, R_VOUT_SECONDARY)
+    }
+    fn read_vout_mode(&self) -> Result<Option<u8>> {
+        self.mailbox.read_byte(ADDRESS, R_VOUT_MODE)
     }
 }
 

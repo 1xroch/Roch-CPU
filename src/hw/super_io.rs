@@ -200,6 +200,36 @@ impl SuperIo {
         self
     }
 
+    /// MSI's DDR4 boards wire the DRAM rail to the EC input their DDR5 versions use for CPU VDD2
+    /// (on the PRO Z790-P WIFI DDR4 it reads 1.50 V, the DIMMs' VDD; Roch Monitor's map for that
+    /// board says the same). Name it for what it measures there.
+    pub fn with_ddr4_labels(mut self, ddr4: bool) -> SuperIo {
+        if ddr4 && self.kind == SuperIoKind::NuvotonEc {
+            for rail in &mut self.named_rails {
+                if rail.1 == Self::RAIL_VDD2 {
+                    rail.0 = Self::DRAM_RAIL_NAME;
+                }
+            }
+        }
+        self
+    }
+
+    pub const DRAM_RAIL_NAME: &'static str = "DRAM Voltage";
+
+    /// The input that measures VCCSA, where it is known: named in a confirmed board map, or MSI's
+    /// EC Nuvoton layout (input 5, which matches the MCHBAR's VCCSA on the PRO Z790-P).
+    pub fn sa_channel(&self) -> Option<i32> {
+        if let Some(r) = self.named_rails.iter().find(|r| r.0 == "VCCSA") {
+            return Some(r.1);
+        }
+        (self.kind == SuperIoKind::NuvotonEc).then_some(Self::RAIL_SA)
+    }
+
+    /// What input [`SuperIo::RAIL_VDD2`] carries on this board, by its name.
+    pub fn vdd2_input_is_dram(&self) -> bool {
+        self.named_rails.iter().any(|r| r.1 == Self::RAIL_VDD2 && r.0 == Self::DRAM_RAIL_NAME)
+    }
+
     fn new(drv: Arc<dyn KernelDriver>, sio_port: u16, base_addr: u16, kind: SuperIoKind, name: String) -> SuperIo {
         let named_rails = if kind == SuperIoKind::NuvotonEc {
             vec![("CPU VDD2 Voltage", Self::RAIL_VDD2), ("CPU AUX Voltage", Self::RAIL_AUX)]

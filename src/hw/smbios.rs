@@ -17,7 +17,15 @@ pub struct SmbiosInfo {
     pub board_version: String,
     /// AMD firmware version, e.g. "ComboAm5PI 1.2.0.3e Patch A". Empty on Intel.
     pub agesa: String,
+    /// SMBIOS type 17 memory type of each populated slot (0x1A DDR4, 0x22 DDR5). Empty when the
+    /// table could not be read (on Linux the raw table is root's).
+    pub memory_types: Vec<u8>,
 }
+
+/// SMBIOS memory type codes (type 17, offset 0x12).
+pub const MEMORY_DDR4: u8 = 0x1A;
+#[cfg(test)]
+const MEMORY_DDR5: u8 = 0x22;
 
 /// `Encoding.ASCII.GetString`: bytes above 0x7F become '?'.
 fn ascii(bytes: &[u8]) -> String {
@@ -48,6 +56,16 @@ impl SmbiosInfo {
         }
     }
 
+    /// A DDR4 machine: every populated slot says DDR4, or, without the memory table, the board's
+    /// own name says so (MSI names its DDR4 boards "... DDR4"). On these boards MSI's EC input
+    /// that carries CPU VDD2 on the DDR5 version carries the DRAM rail instead.
+    pub fn is_ddr4(&self) -> bool {
+        if self.memory_types.is_empty() {
+            return self.board_product.to_ascii_uppercase().contains("DDR4");
+        }
+        self.memory_types.iter().all(|&t| t == MEMORY_DDR4)
+    }
+
     pub fn read() -> SmbiosInfo {
         match FirmwareTables::get(FirmwareTables::RSMB, 0) {
             Some(raw) => SmbiosInfo::parse(&raw),
@@ -76,6 +94,7 @@ impl SmbiosInfo {
             board_product: read("board_name"),
             board_version: read("board_version"),
             agesa: String::new(),
+            memory_types: Vec::new(),
         }
     }
 
@@ -144,6 +163,13 @@ impl SmbiosInfo {
                 40 if info.agesa.is_empty() => {
                     if let Some(agesa) = strings.iter().find(|x| x.starts_with("AGESA")) {
                         info.agesa = strip_agesa_prefix(agesa).trim().to_string();
+                    }
+                }
+                // Type 17, Memory Device: size at 0x0C (0 = empty slot), memory type at 0x12.
+                17 if len > 0x12 => {
+                    let size = u16::from_le_bytes([at(pos + 0x0C), at(pos + 0x0D)]);
+                    if size != 0 {
+                        info.memory_types.push(at(pos + 0x12));
                     }
                 }
                 127 => return info,
@@ -280,6 +306,31 @@ mod tests {
         assert_eq!(info.board_version, "1.0");
         assert_eq!(info.agesa, "ComboAm5PI 1.2.0.3e Patch A");
         assert_eq!(info.mainboard_model(), "Micro-Star International Co., Ltd. MAG X870 TOMAHAWK WIFI (MS-7E51)");
+    }
+
+    /// A type 17 record: size at 0x0C, memory type at 0x12 (0x18 bytes of fields after the header).
+    fn memory_device(size_mb: u16, memory_type: u8) -> Vec<u8> {
+        let mut f = vec![0u8; 0x18];
+        f[0x0C - 4..0x0E - 4].copy_from_slice(&size_mb.to_le_bytes());
+        f[0x12 - 4] = memory_type;
+        structure(17, &f, &[])
+    }
+
+    #[test]
+    fn memory_generation_from_populated_slots_or_the_board_name() {
+        let ddr4 = SmbiosInfo::parse(&table(&[
+            memory_device(0, 0x02), // empty slot, type "unknown": ignored
+            memory_device(16384, MEMORY_DDR4),
+            memory_device(16384, MEMORY_DDR4),
+        ]));
+        assert_eq!(ddr4.memory_types, vec![MEMORY_DDR4, MEMORY_DDR4]);
+        assert!(ddr4.is_ddr4());
+        let ddr5 = SmbiosInfo::parse(&table(&[memory_device(16384, MEMORY_DDR5)]));
+        assert!(!ddr5.is_ddr4());
+        let by_name = SmbiosInfo { board_product: "PRO Z790-P WIFI DDR4 (MS-7E06)".into(), ..SmbiosInfo::default() };
+        assert!(by_name.is_ddr4());
+        let other = SmbiosInfo { board_product: "Z790MPOWER (MS-7E01)".into(), ..SmbiosInfo::default() };
+        assert!(!other.is_ddr4());
     }
 
     #[test]

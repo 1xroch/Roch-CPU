@@ -554,7 +554,7 @@ impl HardwareModel {
         *lock(&self.super_io_status) = status.clone();
         self.emit(&format!("Super I/O: {status}"));
         let Some(sio) = sio else { return Ok(()) };
-        let sio = Arc::new(sio.with_board_rails(&self.smbios.board_product));
+        let sio = Arc::new(sio.with_board_rails(&self.smbios.board_product).with_ddr4_labels(self.smbios.is_ddr4()));
         let _ = self.super_io.set(sio.clone());
 
         let rails = sio.read_rails();
@@ -597,6 +597,12 @@ impl HardwareModel {
                 let _ = self.bclk_control.set(Arc::new(control));
             }
             self.emit(&format!("Clock generator: {status}"));
+        }
+        // The VDD2 regulator's 1.10-1.45 V window and step model were measured on DDR5 boards. On
+        // a DDR4 board that EC input is the DRAM rail, so nothing here drives it.
+        if sio.vdd2_input_is_dram() {
+            self.emit("CPU VDD2: not on this DDR4 board (that input is the DRAM rail, shown read-only)");
+            return Ok(());
         }
         let sio2 = sio.clone();
         let vdd2 = Vdd2Rail::new(mailbox, Box::new(move || sio2.read_voltage(SuperIo::RAIL_VDD2)));
@@ -1058,7 +1064,9 @@ impl HardwareModel {
             let mut s = Setting::new(id, name, SettingGroup::Power);
             s.unit = "W".into();
             s.min = 10.0;
-            s.max = 4095.0;
+            // The field's own ceiling (0x7FFF power units, 4095.875 W at 1/8 W), so the BIOS's
+            // "unlimited" value found at start-up can be written back.
+            s.max = cpu.as_ref().and_then(|c| c.power_unit().ok()).map_or(4095.875, |u| 0x7FFF as f64 * u);
             s.decimals = 0;
             if let Some(c) = cpu.clone() {
                 let r = c.clone();
@@ -1473,6 +1481,24 @@ impl HardwareModel {
             Some(v) if v >= 0.05 => {}
             _ => return,
         }
+        if sio.vdd2_input_is_dram() {
+            // Board group and a name the row-label shortener leaves alone ("DRAM ... Voltage" in
+            // the Memory group is how the per-DIMM PMIC rows are spelled, and those are DDR5's).
+            let mut s = Setting::new("board_dram_v", "DIMM VDD (DDR4)", SettingGroup::Board);
+            s.unit = "V".into();
+            s.min = 0.0;
+            s.max = 5.0;
+            s.decimals = 3;
+            let r = sio.clone();
+            s.read = Arc::new(move || Ok(r.read_voltage(SuperIo::RAIL_VDD2)));
+            s.note = Some(
+                "The DIMMs' supply on this DDR4 board, measured through the Super I/O. Read-only: it is set in the BIOS."
+                    .into(),
+            );
+            s.available = true;
+            rows.push(s);
+            return;
+        }
         let rail = self.vdd2();
         let mut s = Setting::new("cpu_vdd2", "CPU VDD2 Voltage", SettingGroup::Board);
         s.unit = "V".into();
@@ -1719,6 +1745,16 @@ impl HardwareModel {
         let vid_before = if verify { self.sample_vid() } else { None };
         let setting_before = s.current;
         let unit_suffix = if s.unit.is_empty() { String::new() } else { format!(" {}", s.unit) };
+        // A limit that is not a whole display step (PL1's 4095.875 W shows as "4096") must still
+        // accept the number the row shows: snap to the bound within half a display step.
+        let half_step = 0.5 * 10f64.powi(-(s.decimals as i32));
+        let value = if value > s.max && value - s.max <= half_step {
+            s.max
+        } else if value != 0.0 && value < s.min && s.min - value <= half_step {
+            s.min
+        } else {
+            value
+        };
 
         let r: Result<bool> = (|| {
             if value == 0.0 {
@@ -2106,6 +2142,29 @@ mod tests {
         let ok = hw.apply("cpu_ratio", 54.0);
         let row = hw.setting("cpu_ratio").unwrap();
         assert!(ok && row.last_error.is_none() && row.current == Some(54.0), "Retry didn't recover");
+    }
+
+    #[test]
+    fn the_value_a_row_shows_at_its_bound_is_accepted() {
+        // PL1 left "unlimited" by the BIOS is 4095.875 W and shows as "4096".
+        let written = Arc::new(AtomicU64::new(0));
+        let mut s = Setting::new("pl1", "Power Limit 1 (PL1)", SettingGroup::Power);
+        s.unit = "W".into();
+        s.min = 10.0;
+        s.max = 4095.875;
+        s.decimals = 0;
+        let w = written.clone();
+        s.read = Arc::new(move || Ok(Some(f64::from_bits(w.load(Ordering::SeqCst)))));
+        let w = written.clone();
+        s.write = Some(Arc::new(move |v| {
+            w.store(v.to_bits(), Ordering::SeqCst);
+            Ok(())
+        }));
+        let hw = model();
+        hw.settings().push(s);
+        assert!(hw.apply("pl1", 4096.0), "{:?}", hw.setting("pl1").unwrap().last_error);
+        assert_eq!(f64::from_bits(written.load(Ordering::SeqCst)), 4095.875);
+        assert!(!hw.apply("pl1", 4097.0), "a whole step past the bound must still be refused");
     }
 
     #[test]
