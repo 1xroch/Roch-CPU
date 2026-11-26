@@ -219,6 +219,8 @@ impl SmbusI801 {
             self.out(HST_CNT, 0)?;
             sts = self.inp(HST_STS)?;
             if (sts & STS_BUSY) != 0 {
+                // Reading HST_STS claimed INUSE_STS; hand it back even though nothing was sent.
+                self.out(HST_STS, STS_INUSE)?;
                 return Ok(None);
             }
         }
@@ -283,6 +285,7 @@ impl SmbusI801 {
             native::sleep_ms(1);
             self.out(HST_CNT, 0)?;
             if (self.inp(HST_STS)? & STS_BUSY) != 0 {
+                self.out(HST_STS, STS_INUSE)?;
                 return Ok(None);
             }
         }
@@ -353,6 +356,10 @@ impl SmbusI801 {
             }
         }
         let after = self.inp(HST_STS)?;
+        // That read claimed INUSE_STS again (any read of HST_STS does, when it is clear). A
+        // recovery that ended holding it left every tool that honours the semaphore - Roch
+        // Monitor through PawnIO's SmbusI801, for one - timing out on the DIMMs.
+        self.out(HST_STS, STS_INUSE)?;
         Ok(format!("HST_STS 0x{before:02X} -> 0x{after:02X}"))
     }
 
@@ -374,6 +381,7 @@ impl SmbusI801 {
         native::sleep_ms(10);
         let after = self.drv.read_pci_config(self.bus, DEVICE, FUNCTION, 0x40).unwrap_or(0);
         let sts = self.inp(HST_STS)?;
+        self.out(HST_STS, STS_INUSE)?; // the read above claimed the semaphore; release it
         Ok(format!("HSTCFG 0x{before:02X} -> 0x{after:02X}, HST_STS now 0x{sts:02X}"))
     }
 
